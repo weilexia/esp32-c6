@@ -1,0 +1,83 @@
+menu "Smart Calendar, Weather & AI Voice Alarm"
+
+    menu "Wi-Fi & Time Configuration"
+        config APP_WIFI_SSID
+            string "Wi-Fi SSID"
+            default ""
+            help
+                Wi-Fi network name (SSID). Leave empty to run offline (RTC + local calendar/NLP alarms still work).
+
+        config APP_WIFI_PASSWORD
+            string "Wi-Fi Password"
+            default ""
+            help
+                Wi-Fi password (WPA2/WPA3).
+
+        config APP_TIMEZONE
+            string "POSIX Timezone String"
+            default "CST-8"
+            help
+                POSIX timezone string, e.g. "CST-8" for Beijing (UTC+8), "EST5EDT,M3.2.0,M11.1.0" for US Eastern.
+    endmenu
+
+    menu "Weather Configuration (Open-Meteo, No API Key Needed)"
+        config APP_WEATHER_CITY
+            string "City Name (Display)"
+            default "Beijing"
+            help
+                City name displayed on the weather screen (ASCII recommended for built-in bitmap font).
+
+        config APP_WEATHER_LAT
+            string "Latitude"
+            default "39.9042"
+            help
+                Latitude in decimal degrees for Open-Meteo weather query.
+
+        config APP_WEATHER_LON
+            string "Longitude"
+            default "116.4074"
+            help
+                Longitude in decimal degrees for Open-Meteo weather query.
+
+        config APP_WEATHER_REFRESH_MIN
+            int "Weather Refresh Interval (minutes)"
+            range 5 240
+            default 30
+            help
+                How often to refresh weather data from Open-Meteo.
+    endmenu
+
+    menu "AI Voice & Natural Language Alarm Configuration"
+        config APP_AI_API_KEY
+            string "AI API Key (Bearer Token)"
+            default ""
+            help
+                API key for OpenAI-compatible STT & LLM endpoints.
+                Leave empty to use the built-in offline Chinese/English NLP alarm parser.
+
+        config APP_AI_STT_URL
+            string "Speech-to-Text (STT) Endpoint URL"
+            default "https://api.openai.com/v1/audio/transcriptions"
+            help
+                OpenAI-compatible multipart/form-data Whisper/SenseVoice transcription endpoint.
+
+        config APP_AI_STT_MODEL
+            string "STT Model Name"
+            default "whisper-1"
+            help
+                Model name passed in the multipart form field "model".
+
+        config APP_AI_LLM_URL
+            string "LLM Chat Completions Endpoint URL"
+            default "https://api.openai.com/v1/chat/completions"
+            help
+                OpenAI-compatible chat completions endpoint for parsing natural language into alarm JSON.
+
+        config APP_AI_LLM_MODEL
+            string "LLM Model Name"
+            default "gpt-4o-mini"
+            help
+                LLM model name (e.g. gpt-4o-mini, deepseek-chat, qwen-turbo).
+    endmenu
+
+endmenu
