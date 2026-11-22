@@ -18,7 +18,7 @@ static const char *NVS_NS = "ds_stat";
 
 // Approximate blended price for DeepSeek-V3 (~2.0 RMB per 1M tokens) when estimating tokens from balance delta
 #define DEEPSEEK_EST_TOKENS_PER_RMB 500000.0f
-#define DEEPSEEK_POLL_INTERVAL_MS   (60 * 1000)
+#define DEEPSEEK_POLL_INTERVAL_MS   (10 * 60 * 1000) // Refresh every 10 minutes
 
 static deepseek_usage_t s_usage = {0};
 static uint32_t s_stat_date = 0; // YYYYMMDD
@@ -62,7 +62,7 @@ static void load_nvs_locked(void)
     uint32_t saved_date = 0;
     if (nvs_get_u32(h, "date", &saved_date) == ESP_OK) {
         uint32_t today = get_today_yyyymmdd();
-        if (saved_date == today || today < 20250101) {
+        if (today >= 20250101 && saved_date == today) {
             s_stat_date = saved_date;
             nvs_get_u32(h, "calls", &s_usage.calls);
             nvs_get_u32(h, "errors", &s_usage.errors);
@@ -76,10 +76,18 @@ static void load_nvs_locked(void)
             nvs_get_blob(h, "start_bal", &s_usage.day_start_balance, &sz);
             sz = sizeof(float);
             nvs_get_blob(h, "today_cost", &s_usage.today_cost, &sz);
-            ESP_LOGI(TAG, "Restored today DeepSeek stats: calls=%lu tokens=%llu cost=%.2f",
+            // Auto-clean stale estimated tokens if today's actual spend is 0
+            if (s_usage.tokens_estimated && !s_webhook_cost_active && s_usage.today_cost < 0.0001f) {
+                s_usage.total_tokens = 0;
+            }
+            ESP_LOGI(TAG, "Restored today (%lu) DeepSeek stats: calls=%lu tokens=%llu cost=%.2f",
+                     (unsigned long)today,
                      (unsigned long)s_usage.calls,
                      (unsigned long long)s_usage.total_tokens,
                      s_usage.today_cost);
+        } else {
+            ESP_LOGI(TAG, "Ignoring non-today NVS DeepSeek stats (saved=%lu, today=%lu)",
+                     (unsigned long)saved_date, (unsigned long)today);
         }
     }
     nvs_close(h);
@@ -288,6 +296,7 @@ static void deepseek_task(void *arg)
         const char *key = cfg.deepseek_api_key[0] ? cfg.deepseek_api_key : cfg.ai_api_key;
 
         xSemaphoreTake(s_mutex, portMAX_DELAY);
+        check_day_rollover_locked();
         s_usage.daily_budget = budget;
         if (!key || key[0] == '\0') {
             if (!s_webhook_cost_active && s_usage.calls == 0) {

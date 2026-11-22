@@ -512,6 +512,9 @@ static void console_cmd_task(void *arg)
                              (unsigned long)u.errors, (unsigned long long)u.total_tokens, u.today_cost);
                 } else if (strcmp(line, "dstest") == 0) {
                     deepseek_service_set_usage(729, 1, 682400, 162800, 845200, 10.83f, true);
+                } else if (strcmp(line, "dsreset") == 0) {
+                    deepseek_service_reset_today();
+                    ESP_LOGI(TAG, "DeepSeek today stats reset to 0");
                 } else if (strncmp(line, "bl ", 3) == 0) {
                     int pct = atoi(line + 3);
                     if (pct < 5) pct = 5;

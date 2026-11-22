@@ -450,6 +450,21 @@ void gfx_draw_utf8_centered(int cx, int y, const char *utf8, uint16_t fg, uint16
     gfx_draw_utf8(x, y, utf8, fg, bg);
 }
 
+static bool is_invisible_cp(uint32_t cp)
+{
+    return (cp < 0x20) ||
+           (cp >= 0x200B && cp <= 0x200F) || // ZWSP, ZWNJ, ZWJ, LRM, RLM (common in iOS ANCS!)
+           (cp >= 0x202A && cp <= 0x202E) || // Bidi embedding/override
+           (cp >= 0x2060 && cp <= 0x206F) || // Word joiner, bidi isolates
+           (cp >= 0xFE00 && cp <= 0xFE0F) || // Variation selectors (emoji)
+           (cp == 0xFEFF || cp == 0xFFFC);   // BOM, object replacement
+}
+
+static bool is_space_cp(uint32_t cp)
+{
+    return (cp == 0x00A0) || (cp >= 0x2000 && cp <= 0x200A) || (cp == 0x3000);
+}
+
 void gfx_draw_utf8_wrap(int x, int y, int max_w, int max_lines, int line_h,
                         const char *utf8, uint16_t fg, uint16_t bg)
 {
@@ -474,6 +489,25 @@ void gfx_draw_utf8_wrap(int x, int y, int max_w, int max_lines, int line_h,
 
         uint32_t cp = 0;
         int step = decode_utf8_char(p, &cp);
+        p += step;
+
+        // Skip iOS invisible control/directional/variation-selector characters
+        if (is_invisible_cp(cp)) {
+            continue;
+        }
+        // Normalize non-ASCII spaces (NBSP, ideographic space) to normal ASCII space
+        if (is_space_cp(cp)) {
+            cp = ' ';
+        }
+        // Fallback full-width ASCII (e.g. ！，：（）) to half-width ASCII if not in cn16 table
+        if (cp >= 0xFF01 && cp <= 0xFF5E && font_cn16_get_bitmap((uint16_t)cp) == NULL) {
+            cp = cp - 0xFEE0;
+        }
+        // Replace Emoji (> 0xFFFF or dingbats) with a clean '*' instead of a garbled box
+        if (cp > 0xFFFF || (cp >= 0x2600 && cp <= 0x27BF && font_cn16_get_bitmap((uint16_t)cp) == NULL)) {
+            cp = '*';
+        }
+
         int adv = (cp >= 0x20 && cp <= 0x7E) ? g_font_ascii16_adv[cp - 0x20] : 16;
 
         if (cx - x + adv > max_w) {
@@ -485,14 +519,11 @@ void gfx_draw_utf8_wrap(int x, int y, int max_w, int max_lines, int line_h,
 
         if (cp >= 0x20 && cp <= 0x7E) {
             draw_ascii16_glyph(cx, cy, (char)cp, fg, bg, adv);
-        } else if (cp <= 0xFFFF) {
-            draw_cn16_glyph(cx, cy, (uint16_t)cp, fg, bg);
         } else {
-            draw_cn16_glyph(cx, cy, 0xFFFD, fg, bg);
+            draw_cn16_glyph(cx, cy, (uint16_t)cp, fg, bg);
         }
 
         cx += adv;
-        p += step;
     }
 }
 

@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>ESP32-C6 Usage Deck 产品原型图</title>
+<style>
+:root{
+  /* ---- 重构后色板：拉高层级差、提亮次要文字 ---- */
+  --bg:#000000;
+  --card-top:#121c27;
+  --card-bot:#0a1119;
+  --card-alt:#1c2836;
+  --card-alt-top:#233245;
+  --border:#2a3d53;
+  --border-soft:#1d2b3a;
+  --track:#16222e;
+  --white:#ffffff;
+  --muted:#8fa9c4;
+  --dim:#67839f;
+  --cyan:#38bdf8;
+  --blue:#3b82f6;
+  --green:#4ade80;
+  --green-dim:#22c55e;
+  --amber:#fbbf24;
+  --orange:#fb923c;
+  --red:#f4526a;
+  --purple:#a78bfa;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:radial-gradient(1100px 520px at 50% -8%,#0e1a25 0%,#060a0f 58%,#04070a 100%);
+  color:#c9d6e4;
+  font-family:"Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
+  padding:30px 16px 64px;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:geometricPrecision;
+}
+.page-head{max-width:1080px;margin:0 auto 30px}
+.page-head h1{font-size:22px;font-weight:600;color:#f4f8fc;letter-spacing:.4px}
+.page-head p{margin-top:9px;font-size:13px;line-height:1.9;color:#8298ae}
+.page-head code{font-family:Consolas,monospace;color:var(--green);font-size:12px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.zoom-tip{margin-top:12px;font-size:12px;line-height:1.8;color:#7d93a9}
+.zoom-tip b{color:#fbbf24;font-weight:600}
+.chip{font-size:11px;padding:4px 10px;border-radius:20px;border:1px solid #223244;background:#0c141c;color:#8fa9c4}
+.chip.on{border-color:rgba(74,222,128,.5);color:var(--green);background:rgba(74,222,128,.07)}
+
+/* ============ 网格：500px 定宽列，2 列 / 窄屏自动 1 列 ============ */
+.grid{
+  max-width:1080px;margin:0 auto;
+  display:grid;grid-template-columns:repeat(auto-fit,504px);
+  justify-content:center;gap:42px 24px;
+}
+.cell{display:flex;flex-direction:column;gap:12px}
+.device{
+  padding:12px;border-radius:34px;
+  background:linear-gradient(160deg,#1b242f 0%,#0b1017 55%,#05080b 100%);
+  box-shadow:
+    0 22px 46px rgba(0,0,0,.72),
+    0 0 0 1px rgba(255,255,255,.07),
+    inset 0 1px 0 rgba(255,255,255,.11);
+}
+
+/* ============ 屏幕：整数倍 2x，杜绝重采样发虚 ============ */
+.screen{
+  position:relative;width:240px;height:284px;
+  background:var(--bg);border-radius:20px;overflow:hidden;
+  zoom:2;
+  font-family:Consolas,"Cascadia Mono",monospace;
+  font-variant-numeric:tabular-nums;
+  box-shadow:inset 0 0 0 1px #16202b;
+}
+.caption{font-size:12.5px;color:#8fa3b8;letter-spacing:.3px;padding-left:2px}
+.caption b{color:var(--green);font-weight:600;margin-right:8px}
+.caption span{color:#5e7288}
+
+/* ============ 通用组件 ============ */
+.badge{
+  position:absolute;left:10px;top:8px;width:24px;height:24px;border-radius:6px;
+  background:linear-gradient(180deg,#6ee7a0,#3fcf74);color:#000;
+  font-size:9px;font-weight:700;letter-spacing:.3px;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 0 10px rgba(74,222,128,.3);
+}
+.brand{position:absolute;left:40px;top:9px;font-size:9px;font-weight:700;color:var(--green);letter-spacing:1.1px}
+.brand-sub{position:absolute;left:40px;top:21px;font-size:8px;color:var(--dim);letter-spacing:1.1px}
+.wifi{position:absolute;left:161px;top:12px;display:flex;align-items:center;gap:5px}
+.wifi svg{display:block}
+.wifi .st{font-size:8px;color:var(--green);letter-spacing:.5px}
+.wifi.ap .st{color:var(--amber)}
+.wifi.off .st{color:var(--red)}
+
+.section{position:absolute;left:10px;top:41px;font-size:9px;font-weight:700;color:var(--green);letter-spacing:1px}
+.section-tag{position:absolute;right:10px;top:41.5px;font-size:8.5px;color:var(--dim);letter-spacing:.6px}
+
+/* 卡片：微渐变 + 亮描边 + 顶部高光，取代原来的单色平涂 */
+.card{
+  position:absolute;border-radius:10px;
+  background:linear-gradient(180deg,var(--card-top) 0%,var(--card-bot) 100%);
+  border:1px solid var(--border);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.05);
+}
+.card.accent{border-color:rgba(74,222,128,.75);box-shadow:0 0 0 1px rgba(74,222,128,.12),inset 0 1px 0 rgba(255,255,255,.05)}
+
+.lbl{position:absolute;font-family:Consolas,monospace;font-size:8px;color:var(--muted);letter-spacing:.55px;white-space:nowrap}
+.val,.kpi,.grid-val,.clock,.ring-num,.balance-line{
+  font-family:Bahnschrift,"DIN Alternate","Segoe UI",sans-serif;
+  font-weight:600;font-variant-numeric:tabular-nums;
+}
+.val{position:absolute;color:var(--white);white-space:nowrap}
+.unit{color:var(--green);font-family:Consolas,monospace;font-size:8px;font-weight:700;letter-spacing:.3px}
+.cn{font-family:"Microsoft YaHei UI","Microsoft YaHei",sans-serif;font-size:13px;white-space:nowrap}
+
+/* 底部导航 */
+.bottom{position:absolute;left:0;top:250px;width:240px;height:34px;background:var(--bg)}
+.home-pill{
+  position:absolute;left:8px;top:2px;width:44px;height:24px;border-radius:8px;
+  background:linear-gradient(180deg,#6ee7a0,#3fcf74);color:#02130a;
+  font-size:8px;font-weight:700;letter-spacing:.5px;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 0 12px rgba(74,222,128,.34),inset 0 1px 0 rgba(255,255,255,.4);
+}
+.b-time{position:absolute;left:58px;top:9.5px;font-size:8.5px;color:var(--muted);letter-spacing:.4px}
+.dots{position:absolute;left:96px;top:11px;display:flex;gap:6px;align-items:center}
+.dots i{width:4px;height:4px;border-radius:50%;background:#2c3f52}
+.dots i.on{width:6px;height:6px;background:var(--green);box-shadow:0 0 7px rgba(74,222,128,.8)}
+.set-btn{
+  position:absolute;left:168px;top:2px;width:62px;height:24px;border-radius:8px;
+  background:linear-gradient(180deg,#16212d,#0c141c);
+  border:1px solid rgba(74,222,128,.7);
+  color:var(--green);font-family:"Microsoft YaHei UI",sans-serif;font-size:11px;
+  display:flex;align-items:center;justify-content:center;
+  text-shadow:0 0 8px rgba(74,222,128,.5);
+}
+
+/* ============ PAGE 0 OVERVIEW ============ */
+.ring{position:absolute;left:9px;top:89px;width:110px;height:110px}
+.ring-num{position:absolute;left:9px;top:112px;width:110px;height:30px;text-align:center;
+  font-size:26px;line-height:30px;color:var(--white);letter-spacing:-.3px;
+  text-shadow:0 0 14px rgba(255,255,255,.28)}
+.ring-pct{position:absolute;left:9px;top:145px;width:110px;text-align:center;
+  font-size:9.5px;color:var(--green);letter-spacing:.5px}
+.ring-lbl{position:absolute;left:9px;top:157px;width:110px;text-align:center;
+  font-size:7.5px;color:var(--muted);letter-spacing:.9px}
+
+.kpi{position:absolute;left:138px;font-size:21px;white-space:nowrap}
+.kpi.tok{color:var(--white)}
+.kpi.bal{color:var(--cyan);text-shadow:0 0 12px rgba(56,189,248,.25)}
+.kpi.cost{color:var(--white)}
+.meta{position:absolute;left:8px;top:233px;width:224px;text-align:center;
+  font-size:8px;color:var(--muted);letter-spacing:.5px}
+
+/* ============ PAGE 1 TOKENS ============ */
+.balance-line{position:absolute;left:20px;top:82px;font-size:17px;color:var(--green);
+  white-space:nowrap;text-shadow:0 0 12px rgba(74,222,128,.28)}
+.balance-sub{position:absolute;right:18px;top:85px;font-family:"Microsoft YaHei UI",sans-serif;
+  font-size:10px;color:var(--muted);white-space:nowrap}
+.grid-val{position:absolute;font-size:19px;white-space:nowrap}
+.gv-cyan{color:var(--cyan)}
+.gv-purple{color:var(--purple)}
+.gv-white{color:var(--white)}
+.gv-green{color:var(--green)}
+.tap-hint{position:absolute;left:0;top:232.5px;width:240px;text-align:center;
+  font-size:7.5px;color:var(--dim);letter-spacing:.9px}
+
+/* ============ PAGE 2 ALERTS ============ */
+.clock{position:absolute;left:18px;top:64px;font-size:31px;color:var(--white);letter-spacing:-.4px}
+.weather-t{position:absolute;left:142px;top:64px;font-family:"Microsoft YaHei UI",sans-serif;
+  font-size:12.5px;color:var(--amber);white-space:nowrap}
+.weather-c{position:absolute;left:142px;top:85px;font-family:"Microsoft YaHei UI",sans-serif;
+  font-size:10px;color:var(--muted)}
+.alert-row{position:absolute;left:10px;width:220px;height:36px;border-radius:8px;
+  background:linear-gradient(180deg,#111a24,#0a1119);border:1px solid var(--border-soft)}
+.alert-bar{position:absolute;left:5px;top:6px;width:4px;height:24px;border-radius:2px}
+.bar-red{background:var(--red);box-shadow:0 0 9px rgba(244,82,106,.65)}
+.bar-amber{background:var(--amber);box-shadow:0 0 9px rgba(251,191,36,.55)}
+.bar-cyan{background:var(--cyan);box-shadow:0 0 9px rgba(56,189,248,.55)}
+.alert-time{position:absolute;left:14px;top:4.5px;font-size:8px;color:var(--muted);letter-spacing:.3px}
+.alert-state{position:absolute;left:162px;top:2px;font-family:"Microsoft YaHei UI",sans-serif;font-size:10px}
+.st-red{color:var(--red)}
+.st-green{color:var(--green)}
+.alert-title{position:absolute;left:14px;top:16px;font-family:"Microsoft YaHei UI",sans-serif;
+  font-size:12px;color:var(--white);white-space:nowrap}
+.empty-1{position:absolute;left:0;top:153px;width:240px;text-align:center;
+  font-family:"Microsoft YaHei UI",sans-serif;font-size:14px;color:var(--green)}
+.empty-2{position:absolute;left:0;top:177px;width:240px;text-align:center;
+  font-family:"Microsoft YaHei UI",sans-serif;font-size:12px;color:var(--muted)}
+
+/* ============ PAGE 3 SYSTEM ============ */
+.sys-line{position:absolute;left:18px;font-family:"Microsoft YaHei UI",sans-serif;
+  font-size:11.5px;color:var(--white);white-space:nowrap}
+.sys-right{position:absolute;right:18px;font-family:"Microsoft YaHei UI",sans-serif;font-size:11.5px;white-space:nowrap}
+.c-green{color:var(--green)}
+.c-cyan{color:var(--cyan)}
+.c-muted{color:var(--muted)}
+.bri-lbl{position:absolute;left:20px;top:131px;font-family:"Microsoft YaHei UI",sans-serif;
+  font-size:12px;color:var(--white)}
+.dim-pill{position:absolute;left:136px;top:128px;width:86px;height:22px;border-radius:6px;
+  background:var(--card-alt);border:1px solid #2f4257;
+  display:flex;align-items:center;justify-content:center;
+  font-family:"Microsoft YaHei UI",sans-serif;font-size:10.5px;color:var(--green)}
+.minus,.plus{position:absolute;top:157px;width:30px;height:28px;border-radius:8px;
+  background:linear-gradient(180deg,var(--card-alt-top),#141f2b);border:1px solid #31465c;
+  color:var(--white);font-size:16px;font-family:Arial,sans-serif;
+  display:flex;align-items:center;justify-content:center}
+.minus{left:18px}
+.plus{left:192px}
+.slider{position:absolute;left:54px;top:164px;width:132px;height:14px;border-radius:7px;
+  background:var(--track);border:1px solid #24374a;overflow:hidden}
+.slider .fill{height:100%;width:80%;border-radius:7px;
+  background:linear-gradient(180deg,#6ee7a0,#35c46c);
+  box-shadow:0 0 10px rgba(74,222,128,.45)}
+.hotspot-btn{position:absolute;left:10px;top:202px;width:220px;height:38px;border-radius:10px;
+  background:linear-gradient(180deg,#63e095,#33c96e);color:#02130a;
+  font-family:"Microsoft YaHei UI",sans-serif;font-size:12.5px;font-weight:600;letter-spacing:.2px;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 0 16px rgba(74,222,128,.34),inset 0 1px 0 rgba(255,255,255,.42)}
+
+/* ============ 覆盖层 ============ */
+.ov-card{position:absolute;border-radius:14px;
+  background:linear-gradient(180deg,#111a24 0%,#090f16 100%);
+  border:1px solid var(--border);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
+.ov-title{position:absolute;font-family:"Microsoft YaHei UI",sans-serif;font-size:14px;color:var(--cyan);white-space:nowrap}
+.ov-time{position:absolute;font-size:8.5px;color:var(--muted);letter-spacing:.3px}
+.ov-line{position:absolute;height:1px;background:var(--border-soft)}
+.ov-body{position:absolute;font-family:"Microsoft YaHei UI",sans-serif;font-size:12.5px;
+  line-height:19px;color:#e6eef7;white-space:pre-line}
+
+/* 详情 */
+.tag-lv{position:absolute;left:12px;top:14px;width:96px;height:26px;border-radius:8px;
+  background:linear-gradient(180deg,#f76b81,#dc3a53);
+  display:flex;align-items:center;justify-content:center;
+  color:#fff;font-family:"Microsoft YaHei UI",sans-serif;font-size:12px;font-weight:600;
+  box-shadow:0 0 14px rgba(244,82,106,.4)}
+.back-btn{position:absolute;left:12px;top:234px;width:216px;height:36px;border-radius:10px;
+  background:linear-gradient(180deg,var(--card-alt-top),#131d29);border:1px solid #33485e;
+  display:flex;align-items:center;justify-content:center;
+  color:var(--white);font-family:"Microsoft YaHei UI",sans-serif;font-size:12.5px}
+
+/* 语音告警 */
+.alarm-head{position:absolute;left:12px;top:12px;width:216px;height:40px;border-radius:12px;
+  background:linear-gradient(180deg,#f76b81,#d93650);
+  display:flex;align-items:center;justify-content:center;
+  color:#fff;font-family:"Microsoft YaHei UI",sans-serif;font-size:12.5px;font-weight:600;
+  box-shadow:0 0 18px rgba(244,82,106,.42)}
+.alarm-card{border-color:rgba(244,82,106,.85);box-shadow:0 0 0 1px rgba(244,82,106,.14),inset 0 1px 0 rgba(255,255,255,.05)}
+.alarm-stop{position:absolute;left:12px;top:224px;width:216px;height:44px;border-radius:12px;
+  background:linear-gradient(180deg,#65e297,#32c86d);color:#02130a;
+  display:flex;align-items:center;justify-content:center;
+  font-family:"Microsoft YaHei UI",sans-serif;font-size:12.5px;font-weight:600;
+  box-shadow:0 0 18px rgba(74,222,128,.36),inset 0 1px 0 rgba(255,255,255,.42)}
+
+/* 微信 */
+.wx-head{position:absolute;left:12px;top:14px;width:216px;height:36px;border-radius:10px;
+  background:linear-gradient(180deg,#6ee7a0,#3ecf75);color:#02130a;
+  display:flex;align-items:center;justify-content:center;
+  font-family:"Microsoft YaHei UI",sans-serif;font-size:13px;font-weight:600;
+  box-shadow:0 0 16px rgba(74,222,128,.34)}
+.wx-close{position:absolute;left:20px;top:232px;width:200px;height:36px;border-radius:10px;
+  background:linear-gradient(180deg,var(--card-alt-top),#131d29);border:1px solid #33485e;
+  display:flex;align-items:center;justify-content:center;
+  color:var(--white);font-family:"Microsoft YaHei UI",sans-serif;font-size:12.5px}
+
+/* 配网 */
+.portal-line{position:absolute;left:0;width:240px;text-align:center;
+  font-family:"Microsoft YaHei UI",sans-serif;font-size:11.5px}
+.pl-muted{color:var(--muted)}
+.pl-cyan{color:var(--cyan);font-size:12.5px;letter-spacing:.4px}
+.pl-amber{color:var(--amber);font-size:13px;letter-spacing:.4px}
+.pl-green{color:var(--green)}
+.portal-btn{position:absolute;left:16px;top:222px;width:208px;height:40px;border-radius:10px;
+  background:linear-gradient(180deg,var(--card-alt-top),#131d29);border:1px solid #33485e;
+  display:flex;align-items:center;justify-content:center;
+  color:var(--white);font-family:"Microsoft YaHei UI",sans-serif;font-size:12.5px}
+
+/* ============ 规范区 ============ */
+.spec{max-width:1080px;margin:56px auto 0;padding-top:26px;border-top:1px solid #16202b}
+.spec h2{font-size:15px;color:#e3edf7;font-weight:600;margin-bottom:16px}
+.swatches{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:26px}
+.sw{width:96px}
+.sw div{height:38px;border-radius:8px;border:1px solid rgba(255,255,255,.1)}
+.sw span{display:block;margin-top:6px;font-size:11px;color:#93a6ba}
+.sw em{display:block;font-style:normal;font-family:Consolas,monospace;font-size:10px;color:#5e7186}
+.notes{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+.note{background:linear-gradient(180deg,#0f1721,#0a1018);border:1px solid #1b2836;border-radius:10px;padding:16px 18px}
+.note h3{font-size:12.5px;color:var(--green);font-weight:600;margin-bottom:8px}
+.note p{font-size:12px;line-height:1.85;color:#8fa3b8}
+</style>
+</head>
+<body>
+
+<div class="page-head">
+  <h1>ESP32-C6 Usage Deck · 产品原型图</h1>
+  <p>
+    按 <code>main/ui/app_ui.c</code> 真实绘制坐标还原，屏幕 <code>240 × 284</code>，纯黑 OLED + 霓虹绿
+    <code>#4ADE80</code>。共 4 个主页面 + 告警详情 / 语音告警 / 微信消息 / 热点配网 4 个全屏覆盖层。
+  </p>
+  <div class="chips">
+    <span class="chip on">整数倍 2x 渲染</span>
+    <span class="chip on">4 级明度分层</span>
+    <span class="chip">圆环改用 SVG</span>
+    <span class="chip">2 列自适应 · 不二次缩小</span>
+  </div>
+  <p class="zoom-tip">
+    <b>看之前先确认缩放：</b>预览面板若处于 67% / 80% 等非 100% 缩放，整页会被重采样，小字和 1px 描边一定发虚。在预览里按 <code>Ctrl+0</code> 回到 100%，再按需放大，才是下面的锐利效果。
+  </p>
+</div>
+
+<div class="grid">
+
+  <!-- ============ 01 OVERVIEW ============ -->
+  <div class="cell">
+    <div class="device"><div class="screen">
+      <div class="badge">DS</div>
+      <div class="brand">DEEPSEEK</div>
+      <div class="brand-sub">USAGE DECK</div>
+      <div class="wifi">
+        <svg width="14" height="11" viewBox="0 0 14 11" fill="none" stroke="#4ade80" stroke-width="1.5" stroke-linecap="round">
+          <path d="M1.2 3.7a8.4 8.4 0 0 1 11.6 0"/>
+          <path d="M3.5 6.3a5.2 5.2 0 0 1 7 0"/>
+          <circle cx="7" cy="9.2" r="1" fill="#4ade80" stroke="none"/>
+        </svg>
+        <span class="st">ONLINE</span>
+      </div>
+      <div class="section">OVERVIEW</div>
+      <div class="section-tag">TODAY</div>
+
+      <svg class="ring" viewBox="0 0 110 110">
+        <defs>
+          <filter id="ringGlow" x="-30%" y="-30%" width="160%" height="160%">
+            <feGaussianBlur stdDeviation="2.2" result="b"/>
+            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+        <circle cx="55" cy="55" r="52" fill="none" stroke="#16222e" stroke-width="6"/>
+        <circle cx="55" cy="55" r="52" fill="none" stroke="#4ade80" stroke-width="6"
+                stroke-linecap="round" stroke-dasharray="326.7" stroke-dashoffset="1.3"
+                transform="rotate(-90 55 55)" filter="url(#ringGlow)"/>
+      </svg>
+      <div class="ring-num">99.9</div>
+      <div class="ring-pct">%</div>
+      <div class="ring-lbl">SUCCESS</div>
+
+      <div class="card" style="left:130px;top:60px;width:100px;height:52px"></div>
+      <div class="lbl" style="left:138px;top:67px">TOKENS</div>
+      <div class="kpi tok" style="left:138px;top:79px">845.2<span class="unit">K</span></div>
+
+      <div class="card" style="left:130px;top:118px;width:100px;height:52px"></div>
+      <div class="lbl" style="left:138px;top:125px">BAL (CNY)</div>
+      <div class="kpi bal" style="left:138px;top:137px">128.65</div>
+
+      <div class="card" style="left:130px;top:176px;width:100px;height:52px"></div>
+      <div class="lbl" style="left:138px;top:183px">TODAY (RMB)</div>
+      <div class="kpi cost" style="left:138px;top:195px">10.83</div>
+
+      <div class="meta">CALL:729&nbsp;&nbsp;ERR:1&nbsp;&nbsp;BAT 86%</div>
+
+      <div class="bottom">
+        <div class="home-pill">HOME</div>
+        <div class="b-time">10:24</div>
+        <div class="dots"><i class="on"></i><i></i><i></i><i></i></div>
+        <div class="set-btn">设置</div>
+      </div>
+    </div></div>
+    <div class="caption"><b>01</b>用量总览 OVERVIEW <span>· 圆环成功率 / 三张核心指标卡</span></div>
+  </div>
+
+  <!-- ============ 02 TOKENS ============ -->
+  <div class="cell">
+    <div class="device"><div class="screen">
+      <div class="badge">DS</div>
+      <div class="brand">DEEPSEEK</div>
+      <div class="brand-sub">USAGE DECK</div>
+      <div class="wifi">
+        <svg width="14" height="11" viewBox="0 0 14 11" fill="none" stroke="#4ade80" stroke-width="1.5" stroke-linecap="round">
+          <path d="M1.2 3.7a8.4 8.4 0 0 1 11.6 0"/>
+          <path d="M3.5 6.3a5.2 5.2 0 0 1 7 0"/>
+          <circle cx="7" cy="9.2" r="1" fill="#4ade80" stroke="none"/>
+        </svg>
+        <span class="st">ONLINE</span>
+      </div>
+      <div class="section">TOKENS</div>
+      <div class="section-tag">10:24 SYNC</div>
+
+      <div class="card" style="left:10px;top:58px;width:220px;height:54px"></div>
+      <div class="lbl" style="left:20px;top:65px">DEEPSEEK BALANCE</div>
+      <div class="balance-line">CNY 128.65</div>
+      <div class="balance-sub">赠:50.0 充:78.6</div>
+
+      <div class="card" style="left:10px;top:118px;width:106px;height:50px"></div>
+      <div class="lbl" style="left:18px;top:125px">PROMPT TOKENS</div>
+      <div class="grid-val gv-cyan" style="left:18px;top:137px">682.4<span class="unit">K</span></div>
+
+      <div class="card" style="left:124px;top:118px;width:106px;height:50px"></div>
+      <div class="lbl" style="left:132px;top:125px">COMPLETION</div>
+      <div class="grid-val gv-purple" style="left:132px;top:137px">162.8<span class="unit">K</span></div>
+
+      <div class="card" style="left:10px;top:174px;width:106px;height:50px"></div>
+      <div class="lbl" style="left:18px;top:181px">API CALLS</div>
+      <div class="grid-val gv-white" style="left:18px;top:193px">729</div>
+
+      <div class="card" style="left:124px;top:174px;width:106px;height:50px"></div>
+      <div class="lbl" style="left:132px;top:181px">ERRORS</div>
+      <div class="grid-val gv-green" style="left:132px;top:193px">1</div>
+
+      <div class="tap-hint">TAP SCREEN TO REFRESH</div>
+
+      <div class="bottom">
+        <div class="home-pill">HOME</div>
+        <div class="b-time">10:24</div>
+        <div class="dots"><i></i><i class="on"></i><i></i><i></i></div>
+        <div class="set-btn">设置</div>
+      </div>
+    </div></div>
+    <div class="caption"><b>02</b>Token 明细 TOKENS <span>· 余额拆分 + 四宫格</span></div>
+  </div>
+
+  <!-- ============ 03 ALERTS ============ -->
+  <div class="cell">
+    <div class="device"><div class="screen">
+      <div class="badge">DS</div>
+      <div class="brand">DEEPSEEK</div>
+      <div class="brand-sub">USAGE DECK</div>
+      <div class="wifi">
+        <svg width="14" height="11" viewBox="0 0 14 11" fill="none" stroke="#4ade80" stroke-width="1.5" stroke-linecap="round">
+          <path d="M1.2 3.7a8.4 8.4 0 0 1 11.6 0"/>
+          <path d="M3.5 6.3a5.2 5.2 0 0 1 7 0"/>
+          <circle cx="7" cy="9.2" r="1" fill="#4ade80" stroke="none"/>
+        </svg>
+        <span class="st">ONLINE</span>
+      </div>
+      <div class="section">ALERTS</div>
+      <div class="section-tag">MONITOR</div>
+
+      <div class="card" style="left:10px;top:58px;width:220px;height:52px"></div>
+      <div class="clock">10:24</div>
+      <div class="weather-t">24° 多云</div>
+      <div class="weather-c">北京 · 湿度 58%</div>
+
+      <div class="alert-row" style="top:118px">
+        <div class="alert-bar bar-red"></div>
+        <div class="alert-time">10:23:41</div>
+        <div class="alert-state st-red">未处理</div>
+        <div class="alert-title">服务告警 · API 响应超时</div>
+      </div>
+      <div class="alert-row" style="top:158px">
+        <div class="alert-bar bar-amber"></div>
+        <div class="alert-time">09:58:02</div>
+        <div class="alert-state st-green">已确认</div>
+        <div class="alert-title">余额不足 5 元，请及时充值</div>
+      </div>
+      <div class="alert-row" style="top:198px">
+        <div class="alert-bar bar-cyan"></div>
+        <div class="alert-time">08:12:55</div>
+        <div class="alert-state st-green">已确认</div>
+        <div class="alert-title">系统通知 · 固件启动完成</div>
+      </div>
+
+      <div class="bottom">
+        <div class="home-pill">HOME</div>
+        <div class="b-time">10:24</div>
+        <div class="dots"><i></i><i></i><i class="on"></i><i></i></div>
+        <div class="set-btn">设置</div>
+      </div>
+    </div></div>
+    <div class="caption"><b>03</b>时钟天气与告警 ALERTS <span>· 三级告警色条</span></div>
+  </div>
+
+  <!-- ============ 04 SYSTEM ============ -->
+  <div class="cell">
+    <div class="device"><div class="screen">
+      <div class="badge">DS</div>
+      <div class="brand">DEEPSEEK</div>
+      <div class="brand-sub">USAGE DECK</div>
+      <div class="wifi">
+        <svg width="14" height="11" viewBox="0 0 14 11" fill="none" stroke="#4ade80" stroke-width="1.5" stroke-linecap="round">
+          <path d="M1.2 3.7a8.4 8.4 0 0 1 11.6 0"/>
+          <path d="M3.5 6.3a5.2 5.2 0 0 1 7 0"/>
+          <circle cx="7" cy="9.2" r="1" fill="#4ade80" stroke="none"/>
+        </svg>
+        <span class="st">ONLINE</span>
+      </div>
+      <div class="section">SYSTEM</div>
+      <div class="section-tag">POWER</div>
+
+      <div class="card" style="left:10px;top:56px;width:220px;height:62px"></div>
+      <div class="sys-line" style="top:61px">Wi-Fi: HomeNet_5G</div>
+      <div class="sys-line c-green" style="top:81px">IP: 192.168.1.23</div>
+      <div class="sys-right c-muted" style="top:81px">电量:86%</div>
+      <div class="sys-line c-cyan" style="top:99px">Key:已配</div>
+      <div class="sys-right c-green" style="top:99px">BLE:已连</div>
+
+      <div class="card" style="left:10px;top:124px;width:220px;height:74px"></div>
+      <div class="bri-lbl">亮度 80%</div>
+      <div class="dim-pill">省电:60s</div>
+      <div class="minus">−</div>
+      <div class="plus">+</div>
+      <div class="slider"><div class="fill"></div></div>
+
+      <div class="hotspot-btn">开启配网热点 (192.168.1.4)</div>
+
+      <div class="bottom">
+        <div class="home-pill">HOME</div>
+        <div class="b-time">10:24</div>
+        <div class="dots"><i></i><i></i><i></i><i class="on"></i></div>
+        <div class="set-btn">设置</div>
+      </div>
+    </div></div>
+    <div class="caption"><b>04</b>系统与配网 SYSTEM <span>· 亮度滑块 / 热点入口</span></div>
+  </div>
+
+  <!-- ============ 05 ALERT DETAIL ============ -->
+  <div class="cell">
+    <div class="device"><div class="screen">
+      <div class="tag-lv">严重告警</div>
+      <div class="ov-time" style="left:120px;top:20px">10:23:41</div>
+
+      <div class="ov-card" style="left:12px;top:48px;width:216px;height:178px"></div>
+      <div class="ov-title" style="left:22px;top:57px">服务告警 · API 响应超时</div>
+      <div class="ov-line" style="left:22px;top:80px;width:196px"></div>
+      <div class="ov-body" style="left:22px;top:88px;width:196px">请求 api.deepseek.com/user/balance 超过 10s 未响应，已自动重试 3 次。
+本轮轮询失败，界面数据保持上一次快照。</div>
+
+      <div class="back-btn">返回告警列表</div>
+    </div></div>
+    <div class="caption"><b>05</b>告警详情 <span>· 点击告警行进入</span></div>
+  </div>
+
+  <!-- ============ 06 VOICE ALERT ============ -->
+  <div class="cell">
+    <div class="device"><div class="screen">
+      <div class="alarm-head">告警 · 语音循环播报中</div>
+
+      <div class="ov-card alarm-card" style="left:12px;top:60px;width:216px;height:158px"></div>
+      <div class="ov-time" style="left:22px;top:68px">10:23:41</div>
+      <div class="ov-title" style="left:22px;top:86px">服务告警 · API 响应超时</div>
+      <div class="ov-line" style="left:22px;top:110px;width:196px"></div>
+      <div class="ov-body" style="left:22px;top:118px;width:196px">DeepSeek 余额查询接口连续 3 次超时，请检查网络或服务状态。</div>
+
+      <div class="alarm-stop">取消语音提醒 (点此 / BOOT)</div>
+    </div></div>
+    <div class="caption"><b>06</b>语音告警 <span>· 点屏或 BOOT 消警</span></div>
+  </div>
+
+  <!-- ============ 07 WECHAT ============ -->
+  <div class="cell">
+    <div class="device"><div class="screen">
+      <div class="wx-head">微信消息</div>
+
+      <div class="ov-card" style="left:12px;top:58px;width:216px;height:166px"></div>
+      <div class="ov-title" style="left:22px;top:68px">老婆</div>
+      <div class="ov-line" style="left:22px;top:90px;width:196px"></div>
+      <div class="ov-body" style="left:22px;top:100px;width:196px">今晚加班，别等我吃饭了。回来路上买瓶牛奶。</div>
+
+      <div class="wx-close">点击关闭</div>
+    </div></div>
+    <div class="caption"><b>07</b>微信提醒 <span>· BLE ANCS 推送</span></div>
+  </div>
+
+  <!-- ============ 08 PORTAL ============ -->
+  <div class="cell">
+    <div class="device"><div class="screen">
+      <div class="wx-head">Wi-Fi 热点配网已开启</div>
+
+      <div class="ov-card accent" style="left:12px;top:58px;width:216px;height:154px"></div>
+      <div class="portal-line pl-muted" style="top:68px">1. 手机连接无密码热点:</div>
+      <div class="portal-line pl-cyan" style="top:90px">ESP32-UsageDeck</div>
+      <div class="portal-line pl-muted" style="top:120px">2. 手机浏览器访问:</div>
+      <div class="portal-line pl-amber" style="top:142px">http://192.168.1.4</div>
+      <div class="portal-line pl-green" style="top:172px">配置 Wi-Fi 账号密码及 Key</div>
+      <div class="portal-line pl-muted" style="top:190px">保存后设备将自动重启</div>
+
+      <div class="portal-btn">关闭热点并返回</div>
+    </div></div>
+    <div class="caption"><b>08</b>热点配网 <span>· SoftAP 192.168.1.4</span></div>
+  </div>
+
+</div>
+
+<div class="spec">
+  <h2>设计规范</h2>
+  <div class="swatches">
+    <div class="sw"><div style="background:#000000"></div><span>背景黑</span><em>#000000</em></div>
+    <div class="sw"><div style="background:linear-gradient(180deg,#121c27,#0a1119)"></div><span>卡片面</span><em>#121C27 → #0A1119</em></div>
+    <div class="sw"><div style="background:#1c2836"></div><span>交互面</span><em>#1C2836</em></div>
+    <div class="sw"><div style="background:#2a3d53"></div><span>描边</span><em>#2A3D53</em></div>
+    <div class="sw"><div style="background:#4ade80"></div><span>霓虹绿（主色）</span><em>#4ADE80</em></div>
+    <div class="sw"><div style="background:#38bdf8"></div><span>青色（余额）</span><em>#38BDF8</em></div>
+    <div class="sw"><div style="background:#a78bfa"></div><span>紫色（补全）</span><em>#A78BFA</em></div>
+    <div class="sw"><div style="background:#fbbf24"></div><span>琥珀（预警/天气）</span><em>#FBBF24</em></div>
+    <div class="sw"><div style="background:#f4526a"></div><span>玫红（严重告警）</span><em>#F4526A</em></div>
+    <div class="sw"><div style="background:#8fa9c4"></div><span>次要文字</span><em>#8FA9C4</em></div>
+  </div>
+
+  <div class="notes">
+    <div class="note">
+      <h3>清晰度重构</h3>
+      <p>整屏缩放由 1.55x 改为整数 2x，小字号与 1px 描边不再被重采样；页面列宽固定 504px 自适应换列，避免预览面板再次整体缩小导致发虚。</p>
+    </div>
+    <div class="note">
+      <h3>色彩分层</h3>
+      <p>建立 4 级明度：纯黑底 → 卡片 #121C27 → 交互面 #1C2836 → 描边 #2A3D53。次要文字由 #7391B2 提亮至 #8FA9C4，小字号对比度明显提升。</p>
+    </div>
+    <div class="note">
+      <h3>质感与刷新策略</h3>
+      <p>圆环改用 SVG 描边 + 圆头端点，替代 conic-gradient 锯齿；主色数值与按钮加 15% 微光。真机仍是区域差量重绘、零整屏擦黑。</p>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

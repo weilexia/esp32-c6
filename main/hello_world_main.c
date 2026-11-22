@@ -30,7 +30,7 @@ static const char *TAG = "main";
 static void delayed_ble_init_task(void *arg)
 {
     (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(6000));
+    vTaskDelay(pdMS_TO_TICKS(2000));
     ble_ancs_init();
     vTaskDelete(NULL);
 }

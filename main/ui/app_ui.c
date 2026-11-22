@@ -232,11 +232,11 @@ static void draw_overview_data_partial(const deepseek_usage_t *ds, int bat, bool
         else snprintf(ring_num, sizeof(ring_num), "%.1f", ring_pct);
     } else if (ds->balance_valid) {
         float budget = ds->daily_budget > 0.01f ? ds->daily_budget : 20.0f;
-        float rem_ratio = 1.0f - (ds->today_cost / budget);
-        if (rem_ratio < 0.0f) rem_ratio = 0.0f;
-        if (rem_ratio > 1.0f) rem_ratio = 1.0f;
-        ring_pct = rem_ratio * 100.0f;
-        ring_label = ds->is_available ? "BUDGET" : "EMPTY";
+        float used_ratio = ds->today_cost / budget;
+        if (used_ratio < 0.0f) used_ratio = 0.0f;
+        if (used_ratio > 1.0f) used_ratio = 1.0f;
+        ring_pct = used_ratio * 100.0f;
+        ring_label = ds->is_available ? "USED" : "EMPTY";
         if (ring_pct >= 99.95f) snprintf(ring_num, sizeof(ring_num), "100");
         else snprintf(ring_num, sizeof(ring_num), "%.1f", ring_pct);
     } else {
@@ -246,7 +246,7 @@ static void draw_overview_data_partial(const deepseek_usage_t *ds, int bat, bool
     uint16_t ring_col = COL_NEON_GREEN;
     if (ds->calls > 0 && ring_pct < 90.0f) ring_col = COL_ORANGE;
     else if (ds->balance_valid && !ds->is_available) ring_col = COL_RED;
-    else if (ds->balance_valid && ring_pct < 20.0f) ring_col = COL_ORANGE;
+    else if (ds->calls == 0 && ds->balance_valid && ring_pct >= 80.0f) ring_col = COL_ORANGE;
 
     if (force_ring) {
         const int rcx = 64, rcy = 144;
@@ -525,10 +525,17 @@ static void draw_page_system_full(const struct tm *now)
     int bw = gfx_measure_utf8(line);
     gfx_draw_utf8(222 - bw, 82, line, COL_MUTED, COL_CARD);
 
-    snprintf(line, sizeof(line), "DeepSeek Key: %s",
-             (cfg.deepseek_api_key[0] || cfg.ai_api_key[0]) ? "已配置" : "未配置");
+    snprintf(line, sizeof(line), "Key:%s",
+             (cfg.deepseek_api_key[0] || cfg.ai_api_key[0]) ? "已配" : "未配");
     gfx_draw_utf8(18, 100, line,
                   (cfg.deepseek_api_key[0] || cfg.ai_api_key[0]) ? COL_CYAN : COL_AMBER, COL_CARD);
+
+    const char *ble_st = ble_ancs_is_ready() ? "BLE:已连" :
+                         (ble_ancs_is_connected() ? "BLE:配对中" : "BLE:待连");
+    uint16_t ble_col = ble_ancs_is_ready() ? COL_NEON_GREEN :
+                       (ble_ancs_is_connected() ? COL_CYAN : COL_MUTED);
+    int blw = gfx_measure_utf8(ble_st);
+    gfx_draw_utf8(222 - blw, 100, ble_st, ble_col, COL_CARD);
 
     // Brightness & Power-Saving Control Card (y=124..198)
     gfx_fill_round_rect(10, 124, 220, 74, 10, COL_CARD);

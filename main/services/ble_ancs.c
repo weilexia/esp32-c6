@@ -14,7 +14,102 @@
 
 static const char *TAG = "ble_ancs";
 
-#define BLE_DEVICE_NAME "ESP32-C6-Clock"
+#define BLE_DEVICE_NAME "ESP32-UsageDeck"
+
+// Minimal Consumer Control HID Report Map (Usage Page: Consumer, Usage: Consumer Control)
+// Using Consumer Control (instead of Keyboard) ensures iOS shows the device in Settings -> Bluetooth
+// WITHOUT disabling the iPhone on-screen virtual keyboard!
+static const uint8_t s_hid_report_map[] = {
+    0x05, 0x0C,       // Usage Page (Consumer)
+    0x09, 0x01,       // Usage (Consumer Control)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, 0x01,       //   Report ID (1)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0x01,       //   Logical Maximum (1)
+    0x75, 0x01,       //   Report Size (1)
+    0x95, 0x08,       //   Report Count (8)
+    0x09, 0xE9,       //   Usage (Volume Increment)
+    0x09, 0xEA,       //   Usage (Volume Decrement)
+    0x09, 0xE2,       //   Usage (Mute)
+    0x09, 0xCD,       //   Usage (Play/Pause)
+    0x09, 0xB5,       //   Usage (Scan Next Track)
+    0x09, 0xB6,       //   Usage (Scan Previous Track)
+    0x09, 0xB7,       //   Usage (Stop)
+    0x09, 0xB8,       //   Usage (Eject)
+    0x81, 0x02,       //   Input (Data,Var,Abs)
+    0xC0              // End Collection
+};
+
+static const uint8_t s_hid_info[4] = {0x11, 0x01, 0x00, 0x02}; // HID v1.11, NormallyConnectable
+static const uint8_t s_hid_report_ref[2] = {0x01, 0x01};       // Report ID 1, Input
+static uint16_t s_hid_report_handle = 0;
+
+static int hid_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                         struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    uint16_t uuid16 = ble_uuid_u16(ctxt->chr ? ctxt->chr->uuid : ctxt->dsc->uuid);
+    (void)arg;
+
+    if (uuid16 == 0x2A4A) { // HID Information
+        os_mbuf_append(ctxt->om, s_hid_info, sizeof(s_hid_info));
+        return 0;
+    } else if (uuid16 == 0x2A4B) { // Report Map
+        os_mbuf_append(ctxt->om, s_hid_report_map, sizeof(s_hid_report_map));
+        return 0;
+    } else if (uuid16 == 0x2A4D) { // Report
+        uint8_t zero = 0;
+        os_mbuf_append(ctxt->om, &zero, 1);
+        return 0;
+    } else if (uuid16 == 0x2908) { // Report Reference Descriptor
+        os_mbuf_append(ctxt->om, s_hid_report_ref, sizeof(s_hid_report_ref));
+        return 0;
+    } else if (uuid16 == 0x2A4C) { // HID Control Point
+        return 0;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+static const struct ble_gatt_svc_def s_hid_gatt_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = BLE_UUID16_DECLARE(0x1812), // Human Interface Device Service
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A4A), // HID Info
+                .access_cb = hid_access_cb,
+                .flags = BLE_GATT_CHR_F_READ,
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A4B), // Report Map
+                .access_cb = hid_access_cb,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC,
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A4C), // Control Point
+                .access_cb = hid_access_cb,
+                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(0x2A4D), // Input Report
+                .access_cb = hid_access_cb,
+                .val_handle = &s_hid_report_handle,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ_ENC,
+                .descriptors = (struct ble_gatt_dsc_def[]) {
+                    {
+                        .uuid = BLE_UUID16_DECLARE(0x2908), // Report Reference
+                        .att_flags = BLE_ATT_F_READ,
+                        .access_cb = hid_access_cb,
+                    },
+                    {0}
+                },
+            },
+            {0}
+        },
+    },
+    {0}
+};
 
 // Apple Notification Center Service (ANCS) 128-bit UUIDs (little-endian)
 static const ble_uuid128_t ANCS_SVC_UUID = BLE_UUID128_INIT(
@@ -70,6 +165,33 @@ static void store_msg(const char *app_id, const char *title, const char *message
     audio_play_beep_ok();
 }
 
+static void utf8_trim_incomplete(char *s)
+{
+    size_t len = strlen(s);
+    while (len > 0) {
+        uint8_t c = (uint8_t)s[len - 1];
+        if (c < 0x80) break; // Valid 1-byte ASCII
+        // Walk back to find UTF-8 lead byte
+        size_t i = len - 1;
+        while (i > 0 && (((uint8_t)s[i] & 0xC0) == 0x80)) {
+            i--;
+        }
+        uint8_t lead = (uint8_t)s[i];
+        size_t expected = 1;
+        if ((lead & 0xE0) == 0xC0) expected = 2;
+        else if ((lead & 0xF0) == 0xE0) expected = 3;
+        else if ((lead & 0xF8) == 0xF0) expected = 4;
+        else { s[i] = '\0'; len = i; continue; }
+
+        if (len - i < expected) {
+            s[i] = '\0';
+            len = i;
+        } else {
+            break;
+        }
+    }
+}
+
 static void parse_data_source_buffer(void)
 {
     // Format: [cmd_id:1][uid:4] followed by repeated [attr_id:1][len:2][val:len]
@@ -100,11 +222,13 @@ static void parse_data_source_buffer(void)
             size_t n = alen < sizeof(title) - 1 ? alen : sizeof(title) - 1;
             memcpy(title, &s_ds_buf[pos], n);
             title[n] = '\0';
+            utf8_trim_incomplete(title);
             got_title = true;
         } else if (attr_id == 3) {
             size_t n = alen < sizeof(message) - 1 ? alen : sizeof(message) - 1;
             memcpy(message, &s_ds_buf[pos], n);
             message[n] = '\0';
+            utf8_trim_incomplete(message);
             got_msg = true;
         }
         pos += alen;
@@ -115,9 +239,9 @@ static void parse_data_source_buffer(void)
         s_ds_len = 0;
         ESP_LOGI(TAG, "iPhone Notification [%s] %s: %s", app_id, title, message);
 
-        // Filter for WeChat (com.tencent.xin)
-        if (strstr(app_id, "tencent.xin") != NULL) {
-            store_msg(app_id, title[0] ? title : "WeChat", message);
+        // Filter for WeChat (com.tencent.xin) & WeCom (com.tencent.ww)
+        if (strstr(app_id, "tencent.xin") != NULL || strstr(app_id, "tencent.ww") != NULL) {
+            store_msg(app_id, title[0] ? title : "微信", message[0] ? message : "收到一条新消息");
         }
     }
 }
@@ -146,34 +270,65 @@ static void request_notification_attrs(uint32_t uid)
     ble_gattc_write_flat(s_conn_handle, s_cp_val_handle, cmd, sizeof(cmd), NULL, NULL);
 }
 
-static void subscribe_cccd(uint16_t cccd_handle)
-{
-    if (!cccd_handle || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
-    uint8_t val[2] = {0x01, 0x00}; // Enable Notifications
-    ble_gattc_write_flat(s_conn_handle, cccd_handle, val, sizeof(val), NULL, NULL);
-}
-
-static int on_dsc_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
-                       uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+static int on_cccd_write(uint16_t conn_handle, const struct ble_gatt_error *error,
+                         struct ble_gatt_attr *attr, void *arg)
 {
     (void)conn_handle;
+    const char *label = (const char *)arg;
+    ESP_LOGI(TAG, "ANCS %s CCCD (handle=%u) subscribe status=%d",
+             label ? label : "?", attr ? attr->handle : 0, error->status);
+    return 0;
+}
+
+static void subscribe_cccd(uint16_t conn_handle, uint16_t cccd_handle, const char *label)
+{
+    if (!cccd_handle || conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    uint8_t val[2] = {0x01, 0x00}; // Enable Notifications
+    int rc = ble_gattc_write_flat(conn_handle, cccd_handle, val, sizeof(val), on_cccd_write, (void *)label);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "subscribe_cccd(%s, handle=%u) failed rc=%d", label, cccd_handle, rc);
+    }
+}
+
+// Step 2: Discover Notification Source (NS) CCCD (take ONLY the FIRST 0x2902 so we never walk into DS!)
+static int on_ns_dsc_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                          uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+{
+    (void)chr_val_handle;
     (void)arg;
     if (error->status == 0 && dsc) {
-        if (ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16) {
-            if (chr_val_handle == s_ns_val_handle) {
-                s_ns_cccd_handle = dsc->handle;
-            } else if (chr_val_handle == s_ds_val_handle) {
-                s_ds_cccd_handle = dsc->handle;
-            }
+        if (s_ns_cccd_handle == 0 && ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16) {
+            s_ns_cccd_handle = dsc->handle;
         }
     } else if (error->status == BLE_HS_EDONE) {
-        if (s_ds_cccd_handle && !s_ancs_ready) {
-            subscribe_cccd(s_ds_cccd_handle);
+        ESP_LOGI(TAG, "ANCS CCCDs found: NS_CCCD=%u DS_CCCD=%u", s_ns_cccd_handle, s_ds_cccd_handle);
+        if (s_ds_cccd_handle) {
+            subscribe_cccd(conn_handle, s_ds_cccd_handle, "DS");
         }
-        if (s_ns_cccd_handle && !s_ancs_ready) {
-            subscribe_cccd(s_ns_cccd_handle);
+        if (s_ns_cccd_handle) {
+            subscribe_cccd(conn_handle, s_ns_cccd_handle, "NS");
             s_ancs_ready = true;
             ESP_LOGI(TAG, "ANCS subscribed! Waiting for iPhone WeChat notifications...");
+        } else {
+            ESP_LOGW(TAG, "ANCS NS CCCD not found!");
+        }
+    }
+    return 0;
+}
+
+// Step 1: Discover Data Source (DS) CCCD first, then sequentially discover NS CCCD
+static int on_ds_dsc_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                          uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+{
+    (void)chr_val_handle;
+    (void)arg;
+    if (error->status == 0 && dsc) {
+        if (s_ds_cccd_handle == 0 && ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16) {
+            s_ds_cccd_handle = dsc->handle;
+        }
+    } else if (error->status == BLE_HS_EDONE) {
+        if (s_ns_val_handle) {
+            ble_gattc_disc_all_dscs(conn_handle, s_ns_val_handle, s_svc_end, on_ns_dsc_disc, NULL);
         }
     }
     return 0;
@@ -194,10 +349,9 @@ static int on_chr_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
     } else if (error->status == BLE_HS_EDONE) {
         ESP_LOGI(TAG, "ANCS chars: NS=%u CP=%u DS=%u", s_ns_val_handle, s_cp_val_handle, s_ds_val_handle);
         if (s_ds_val_handle) {
-            ble_gattc_disc_all_dscs(conn_handle, s_ds_val_handle, s_svc_end, on_dsc_disc, NULL);
-        }
-        if (s_ns_val_handle) {
-            ble_gattc_disc_all_dscs(conn_handle, s_ns_val_handle, s_svc_end, on_dsc_disc, NULL);
+            ble_gattc_disc_all_dscs(conn_handle, s_ds_val_handle, s_svc_end, on_ds_dsc_disc, NULL);
+        } else if (s_ns_val_handle) {
+            ble_gattc_disc_all_dscs(conn_handle, s_ns_val_handle, s_svc_end, on_ns_dsc_disc, NULL);
         }
     }
     return 0;
@@ -257,7 +411,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_ENC_CHANGE:
         if (event->enc_change.status == 0) {
-            ESP_LOGI(TAG, "BLE link encrypted, discovering ANCS...");
+            ESP_LOGI(TAG, "BLE link encrypted, exchanging MTU & discovering ANCS...");
+            ble_gattc_exchange_mtu(event->enc_change.conn_handle, NULL, NULL);
             start_ancs_discovery(event->enc_change.conn_handle);
         } else {
             ESP_LOGW(TAG, "BLE encryption failed (status=%d)", event->enc_change.status);
@@ -305,28 +460,49 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
 static void start_advertising(void)
 {
+    // Primary ADV packet (28 bytes <= 31): Flags (3) + HID UUID 0x1812 (4) + Appearance (4) + Name (17)
+    // Advertising HID 0x1812 in primary ADV makes iPhone Settings -> Bluetooth display the device natively!
+    static const ble_uuid16_t hid_uuid = BLE_UUID16_INIT(0x1812);
     struct ble_hs_adv_fields fields = {0};
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.uuids16 = (ble_uuid16_t *)&hid_uuid;
+    fields.num_uuids16 = 1;
+    fields.uuids16_is_complete = 1;
+    fields.appearance = 0x03C0; // Generic HID (recognized natively by iOS & Android Bluetooth Settings)
+    fields.appearance_is_present = 1;
     fields.name = (const uint8_t *)BLE_DEVICE_NAME;
     fields.name_len = strlen(BLE_DEVICE_NAME);
     fields.name_is_complete = 1;
 
-    ble_gap_adv_set_fields(&fields);
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_set_fields failed: rc=%d", rc);
+        return;
+    }
 
-    // Put ANCS Service Solicitation UUID in scan response so iOS recognizes ANCS support
-    struct ble_hs_adv_fields rsp = {0};
-    rsp.uuids128 = (ble_uuid128_t *)&ANCS_SVC_UUID;
-    rsp.num_uuids128 = 1;
-    rsp.uuids128_is_complete = 1;
-    ble_gap_adv_rsp_set_fields(&rsp);
+    // Scan Response packet (18 bytes <= 31): Apple ANCS 128-bit Service Solicitation UUID (AD Type 0x15)
+    uint8_t rsp_raw[18];
+    rsp_raw[0] = 17;   // length: 1 byte AD type + 16 bytes UUID
+    rsp_raw[1] = 0x15; // AD Type: List of 128-bit Service Solicitation UUIDs (required by Apple ANCS spec)
+    memcpy(&rsp_raw[2], ANCS_SVC_UUID.value, 16);
+
+    rc = ble_gap_adv_rsp_set_data(rsp_raw, sizeof(rsp_raw));
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_rsp_set_data failed: rc=%d", rc);
+    }
 
     struct ble_gap_adv_params adv_params = {0};
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    // Use relaxed 200..300ms advertising interval so 2.4GHz Wi-Fi stays fast & responsive
-    adv_params.itvl_min = 320;
-    adv_params.itvl_max = 480;
-    ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, gap_event_cb, NULL);
+    // 100..150ms interval: fast phone discovery while keeping 2.4GHz Wi-Fi coexistence smooth
+    adv_params.itvl_min = 160;
+    adv_params.itvl_max = 240;
+    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, gap_event_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_start failed: rc=%d", rc);
+    } else {
+        ESP_LOGI(TAG, "BLE advertising started: name='%s' (HID 0x1812 + ANCS 0x15)", BLE_DEVICE_NAME);
+    }
 }
 
 static void nimble_on_sync(void)
@@ -365,6 +541,8 @@ esp_err_t ble_ancs_init(void)
 
     ble_svc_gap_init();
     ble_svc_gatt_init();
+    ble_gatts_count_cfg(s_hid_gatt_svcs);
+    ble_gatts_add_svcs(s_hid_gatt_svcs);
     ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
     ble_store_config_init();
 
@@ -375,6 +553,16 @@ esp_err_t ble_ancs_init(void)
 bool ble_ancs_is_connected(void)
 {
     return s_connected;
+}
+
+bool ble_ancs_is_ready(void)
+{
+    return s_connected && s_ancs_ready;
+}
+
+const char *ble_ancs_get_device_name(void)
+{
+    return BLE_DEVICE_NAME;
 }
 
 bool ble_ancs_get_latest_msg(ble_ancs_msg_t *out)

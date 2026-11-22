@@ -17,6 +17,8 @@ typedef struct {
 
 esp_err_t ble_ancs_init(void);
 bool ble_ancs_is_connected(void);
+bool ble_ancs_is_ready(void);
+const char *ble_ancs_get_device_name(void);
 bool ble_ancs_get_latest_msg(ble_ancs_msg_t *out);
 
 // Helper for testing Chinese WeChat notification popup from serial console

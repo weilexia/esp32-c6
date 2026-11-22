@@ -10,7 +10,7 @@ extern "C" {
 #define FONT_CN16_H      16
 #define FONT_CN16_BPR    8
 #define FONT_CN16_BYTES  128
-#define FONT_CN16_COUNT  3776
+#define FONT_CN16_COUNT  6793
 
 extern const uint16_t g_font_cn16_codes[FONT_CN16_COUNT];
 extern const uint8_t g_font_cn16_bitmaps[FONT_CN16_COUNT][FONT_CN16_BYTES];
