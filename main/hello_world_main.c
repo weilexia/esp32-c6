@@ -16,6 +16,7 @@
 #include "drivers/touch_cst816d.h"
 #include "drivers/audio_codec.h"
 
+#include "services/app_config.h"
 #include "services/wifi_time.h"
 #include "services/weather_service.h"
 #include "services/alarm_manager.h"
@@ -47,7 +48,8 @@ void app_main(void)
     touch_cst816d_init();
     audio_codec_init();
 
-    // 4. Core Services: Wi-Fi + SNTP, Weather (Open-Meteo), Alarm Manager, AI Voice & Serial NLP
+    // 4. Core Services: Runtime NVS Config, Wi-Fi + SNTP, Weather (Open-Meteo), Alarm Manager, AI Voice & Serial NLP
+    app_config_init();
     wifi_time_init();
     weather_service_start();
     alarm_manager_init();

@@ -6,6 +6,7 @@
 #include "gfx.h"
 #include "touch_cst816d.h"
 #include "weather_service.h"
+#include "web_portal.h"
 #include "wifi_time.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -36,6 +37,10 @@ static bool s_prev_pressed = false;
 static uint16_t s_touch_start_x = 0;
 static uint16_t s_touch_start_y = 0;
 static bool s_prev_boot_btn = false;
+static int s_boot_press_ticks = 0;
+static bool s_boot_long_fired = false;
+static bool s_was_portal = false;
+static bool s_portal_dismissed = false;
 
 static const char *DOW_NAMES[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 
@@ -311,6 +316,25 @@ static void draw_page_ai_voice(void)
     draw_bottom_nav("Home", "Cal", "Alarm", -1);
 }
 
+static void draw_portal_overlay(void)
+{
+    gfx_fill_screen(COL_BG);
+    gfx_fill_round_rect(14, 18, 212, 36, 10, COL_BLUE);
+    gfx_draw_text_centered(120, 28, "Wi-Fi Setup", COL_WHITE, COL_BLUE, 2);
+
+    gfx_fill_round_rect(14, 66, 212, 134, 12, COL_CARD);
+    gfx_draw_text_centered(120, 78, "1. Connect Phone Wi-Fi:", COL_MUTED, COL_CARD, 1);
+    gfx_draw_text_centered(120, 96, web_portal_get_ap_ssid(), COL_CYAN, COL_CARD, 1);
+
+    gfx_draw_text_centered(120, 124, "2. Open in Browser:", COL_MUTED, COL_CARD, 1);
+    gfx_draw_text_centered(120, 142, "http://192.168.4.1", COL_AMBER, COL_CARD, 1);
+
+    gfx_draw_text_centered(120, 174, "Set Wi-Fi & AI API Key", COL_GREEN, COL_CARD, 1);
+
+    gfx_fill_round_rect(26, 218, 188, 36, 10, COL_CARD_ALT);
+    gfx_draw_text_centered(120, 231, "Tap to Use Offline", COL_WHITE, COL_CARD_ALT, 1);
+}
+
 static void draw_ringing_overlay(const alarm_entry_t *a)
 {
     gfx_fill_screen(COL_BG);
@@ -461,16 +485,30 @@ void app_ui_init(void)
 
 void app_ui_tick(void)
 {
-    // 1. Hardware BOOT button handling (active-low)
+    // 1. Hardware BOOT button handling (active-low: short press = AI/dismiss, long press 2.5s = Wi-Fi Setup)
     bool boot_pressed = (gpio_get_level(BOARD_BTN_BOOT_GPIO) == 0);
-    if (boot_pressed && !s_prev_boot_btn) {
-        if (alarm_manager_is_ringing(NULL)) {
-            alarm_manager_dismiss();
-        } else {
-            s_page = PAGE_AI_VOICE;
-            ai_voice_alarm_start_listening();
+    if (boot_pressed) {
+        s_boot_press_ticks++;
+        if (s_boot_press_ticks >= 85 && !s_boot_long_fired) {
+            s_boot_long_fired = true;
+            s_portal_dismissed = false;
+            web_portal_start();
+            s_dirty = true;
         }
-        s_dirty = true;
+    } else if (s_prev_boot_btn) {
+        if (!s_boot_long_fired) {
+            if (alarm_manager_is_ringing(NULL)) {
+                alarm_manager_dismiss();
+            } else if (web_portal_is_active() && !s_portal_dismissed) {
+                s_portal_dismissed = true;
+            } else {
+                s_page = PAGE_AI_VOICE;
+                ai_voice_alarm_start_listening();
+            }
+            s_dirty = true;
+        }
+        s_boot_press_ticks = 0;
+        s_boot_long_fired = false;
     }
     s_prev_boot_btn = boot_pressed;
 
@@ -481,15 +519,20 @@ void app_ui_tick(void)
         s_touch_start_x = pt.x;
         s_touch_start_y = pt.y;
     } else if (!pt.pressed && s_prev_pressed) {
-        int dx = (int)pt.x - (int)s_touch_start_x;
-        if (dx > 45 && !alarm_manager_is_ringing(NULL)) {
-            s_page = (ui_page_t)((s_page + PAGE_COUNT - 1) % PAGE_COUNT);
-            s_dirty = true;
-        } else if (dx < -45 && !alarm_manager_is_ringing(NULL)) {
-            s_page = (ui_page_t)((s_page + 1) % PAGE_COUNT);
+        if (web_portal_is_active() && !s_portal_dismissed && !alarm_manager_is_ringing(NULL)) {
+            s_portal_dismissed = true;
             s_dirty = true;
         } else {
-            handle_tap(s_touch_start_x, s_touch_start_y);
+            int dx = (int)pt.x - (int)s_touch_start_x;
+            if (dx > 45 && !alarm_manager_is_ringing(NULL)) {
+                s_page = (ui_page_t)((s_page + PAGE_COUNT - 1) % PAGE_COUNT);
+                s_dirty = true;
+            } else if (dx < -45 && !alarm_manager_is_ringing(NULL)) {
+                s_page = (ui_page_t)((s_page + 1) % PAGE_COUNT);
+                s_dirty = true;
+            } else {
+                handle_tap(s_touch_start_x, s_touch_start_y);
+            }
         }
     }
     s_prev_pressed = pt.pressed;
@@ -504,6 +547,23 @@ void app_ui_tick(void)
     if (ringing) {
         if (s_dirty) {
             draw_ringing_overlay(&ring_a);
+            s_dirty = false;
+        }
+        return;
+    }
+
+    // 3b. SoftAP Wi-Fi setup portal overlay
+    bool portal_on = web_portal_is_active();
+    if (portal_on != s_was_portal) {
+        s_was_portal = portal_on;
+        if (portal_on) {
+            s_portal_dismissed = false;
+        }
+        s_dirty = true;
+    }
+    if (portal_on && !s_portal_dismissed) {
+        if (s_dirty) {
+            draw_portal_overlay();
             s_dirty = false;
         }
         return;

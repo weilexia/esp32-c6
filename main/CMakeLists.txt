@@ -7,6 +7,8 @@ idf_component_register(
         "drivers/lcd_st7789.c"
         "drivers/touch_cst816d.c"
         "drivers/audio_codec.c"
+        "services/app_config.c"
+        "services/web_portal.c"
         "services/wifi_time.c"
         "services/weather_service.c"
         "services/alarm_manager.c"
@@ -32,6 +34,7 @@ idf_component_register(
         esp_event
         esp_netif
         esp_http_client
+        esp_http_server
         esp-tls
         mbedtls
         lwip

@@ -1,6 +1,8 @@
 #include "ai_voice_alarm.h"
 #include "alarm_manager.h"
+#include "app_config.h"
 #include "audio_codec.h"
+#include "web_portal.h"
 #include "wifi_time.h"
 #include "sdkconfig.h"
 #include "esp_crt_bundle.h"
@@ -253,7 +255,9 @@ static bool local_nlp_parse_and_apply(const char *text, char *reply, size_t repl
 // === Cloud OpenAI-compatible LLM Intent Parser ===
 static bool cloud_llm_parse_and_apply(const char *utterance, char *reply, size_t reply_sz)
 {
-    if (!wifi_time_is_connected() || strlen(CONFIG_APP_AI_API_KEY) == 0 || strlen(CONFIG_APP_AI_LLM_URL) == 0) {
+    app_config_t app_cfg;
+    app_config_get(&app_cfg);
+    if (!wifi_time_is_connected() || strlen(app_cfg.ai_api_key) == 0 || strlen(app_cfg.ai_llm_url) == 0) {
         return false;
     }
 
@@ -284,15 +288,15 @@ static bool cloud_llm_parse_and_apply(const char *utterance, char *reply, size_t
              "{\\\"action\\\":\\\"set\\\"|\\\"delete_all\\\"|\\\"none\\\",\\\"hour\\\":0-23,\\\"minute\\\":0-59,"
              "\\\"repeat_daily\\\":false,\\\"label\\\":\\\"short ASCII label\\\",\\\"reply\\\":\\\"short ASCII reply\\\"}.\"},"
              "{\"role\":\"user\",\"content\":\"%s\"}]}",
-             CONFIG_APP_AI_LLM_MODEL,
+             app_cfg.ai_llm_model,
              now.tm_year + 1900, now.tm_mon + 1, now.tm_mday, now.tm_hour, now.tm_min,
              safe_utt);
 
     char auth_hdr[192];
-    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", CONFIG_APP_AI_API_KEY);
+    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", app_cfg.ai_api_key);
 
     esp_http_client_config_t cfg = {
-        .url = CONFIG_APP_AI_LLM_URL,
+        .url = app_cfg.ai_llm_url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 12000,
         .crt_bundle_attach = esp_crt_bundle_attach,
@@ -364,7 +368,9 @@ static bool cloud_llm_parse_and_apply(const char *utterance, char *reply, size_t
 // === Cloud OpenAI-compatible Whisper/SenseVoice STT ===
 static bool cloud_stt_transcribe(const uint8_t *wav_data, size_t wav_len, char *out_text, size_t out_sz)
 {
-    if (!wifi_time_is_connected() || strlen(CONFIG_APP_AI_API_KEY) == 0 || strlen(CONFIG_APP_AI_STT_URL) == 0) {
+    app_config_t app_cfg;
+    app_config_get(&app_cfg);
+    if (!wifi_time_is_connected() || strlen(app_cfg.ai_api_key) == 0 || strlen(app_cfg.ai_stt_url) == 0) {
         return false;
     }
 
@@ -381,17 +387,17 @@ static bool cloud_stt_transcribe(const uint8_t *wav_data, size_t wav_len, char *
                            "\r\n--%s\r\n"
                            "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
                            "%s\r\n--%s--\r\n",
-                           boundary, CONFIG_APP_AI_STT_MODEL, boundary);
+                           boundary, app_cfg.ai_stt_model, boundary);
 
     int total_len = hdr_len + (int)wav_len + ftr_len;
 
     char content_type[96];
     snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
     char auth_hdr[192];
-    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", CONFIG_APP_AI_API_KEY);
+    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", app_cfg.ai_api_key);
 
     esp_http_client_config_t cfg = {
-        .url = CONFIG_APP_AI_STT_URL,
+        .url = app_cfg.ai_stt_url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 15000,
         .crt_bundle_attach = esp_crt_bundle_attach,
@@ -485,10 +491,13 @@ static void voice_capture_task(void *arg)
     bool stt_ok = (wav_len > 1000) && cloud_stt_transcribe(wav_buf, wav_len, text, sizeof(text));
     free(wav_buf);
 
+    app_config_t app_cfg;
+    app_config_get(&app_cfg);
+
     if (stt_ok && text[0] != '\0') {
         ai_voice_alarm_process_text(text);
-    } else if (strlen(CONFIG_APP_AI_API_KEY) == 0) {
-        set_status(AI_VOICE_ERROR, "No API Key", "Use Serial: ai <cmd>");
+    } else if (strlen(app_cfg.ai_api_key) == 0) {
+        set_status(AI_VOICE_ERROR, "No API Key", "Hold BOOT 3s: Setup");
         audio_play_beep_err();
     } else {
         set_status(AI_VOICE_ERROR, "", "STT failed");
@@ -519,6 +528,8 @@ static void console_ai_task(void *arg)
                 line[pos] = '\0';
                 if (strncmp(line, "ai ", 3) == 0) {
                     ai_voice_alarm_process_text(line + 3);
+                } else if (strcmp(line, "setup") == 0) {
+                    web_portal_start();
                 } else if (strcmp(line, "alarms") == 0) {
                     alarm_entry_t list[ALARM_MAX_COUNT];
                     alarm_manager_get_all(list, ALARM_MAX_COUNT);

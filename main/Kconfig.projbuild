@@ -57,27 +57,27 @@ menu "Smart Calendar, Weather & AI Voice Alarm"
 
         config APP_AI_STT_URL
             string "Speech-to-Text (STT) Endpoint URL"
-            default "https://api.openai.com/v1/audio/transcriptions"
+            default "https://api.siliconflow.cn/v1/audio/transcriptions"
             help
                 OpenAI-compatible multipart/form-data Whisper/SenseVoice transcription endpoint.
 
         config APP_AI_STT_MODEL
             string "STT Model Name"
-            default "whisper-1"
+            default "FunAudioLLM/SenseVoiceSmall"
             help
                 Model name passed in the multipart form field "model".
 
         config APP_AI_LLM_URL
             string "LLM Chat Completions Endpoint URL"
-            default "https://api.openai.com/v1/chat/completions"
+            default "https://api.siliconflow.cn/v1/chat/completions"
             help
                 OpenAI-compatible chat completions endpoint for parsing natural language into alarm JSON.
 
         config APP_AI_LLM_MODEL
             string "LLM Model Name"
-            default "gpt-4o-mini"
+            default "Qwen/Qwen2.5-7B-Instruct"
             help
-                LLM model name (e.g. gpt-4o-mini, deepseek-chat, qwen-turbo).
+                LLM model name (e.g. Qwen/Qwen2.5-7B-Instruct, deepseek-ai/DeepSeek-V3, gpt-4o-mini).
     endmenu
 
 endmenu
