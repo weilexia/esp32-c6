@@ -7,12 +7,15 @@ idf_component_register(
         "drivers/lcd_st7789.c"
         "drivers/touch_cst816d.c"
         "drivers/audio_codec.c"
+        "services/alert_server.c"
         "services/app_config.c"
+        "services/ble_ancs.c"
+        "services/deepseek_service.c"
         "services/web_portal.c"
         "services/wifi_time.c"
         "services/weather_service.c"
-        "services/alarm_manager.c"
-        "services/ai_voice_alarm.c"
+        "ui/font_cn16.c"
+        "ui/font_hd.c"
         "ui/gfx.c"
         "ui/app_ui.c"
     INCLUDE_DIRS
@@ -35,6 +38,7 @@ idf_component_register(
         esp_netif
         esp_http_client
         esp_http_server
+        bt
         esp-tls
         mbedtls
         lwip

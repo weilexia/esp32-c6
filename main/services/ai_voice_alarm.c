@@ -2,6 +2,7 @@
 #include "alarm_manager.h"
 #include "app_config.h"
 #include "audio_codec.h"
+#include "ble_ancs.h"
 #include "web_portal.h"
 #include "wifi_time.h"
 #include "sdkconfig.h"
@@ -528,6 +529,12 @@ static void console_ai_task(void *arg)
                 line[pos] = '\0';
                 if (strncmp(line, "ai ", 3) == 0) {
                     ai_voice_alarm_process_text(line + 3);
+                } else if (strcmp(line, "ip") == 0) {
+                    char ip[20];
+                    wifi_time_get_ip(ip, sizeof(ip));
+                    ESP_LOGI(TAG, "Device IP: %s | Webhook: http://%s/api/alert/audio", ip, ip);
+                } else if (strncmp(line, "wx ", 3) == 0) {
+                    ble_ancs_inject_test_msg("微信测试", line + 3);
                 } else if (strcmp(line, "setup") == 0) {
                     web_portal_start();
                 } else if (strcmp(line, "alarms") == 0) {

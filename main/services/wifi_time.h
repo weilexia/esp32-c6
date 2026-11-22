@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <time.h>
 #include "esp_err.h"
 
@@ -9,9 +10,11 @@ extern "C" {
 #endif
 
 esp_err_t wifi_time_init(void);
+esp_err_t wifi_time_reconnect_sta(void);
 bool wifi_time_is_connected(void);
 bool wifi_time_is_synced(void);
 void wifi_time_get_local(struct tm *out_tm);
+void wifi_time_get_ip(char *out_buf, size_t out_sz);
 
 #ifdef __cplusplus
 }

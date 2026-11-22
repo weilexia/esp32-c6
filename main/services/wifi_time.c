@@ -1,4 +1,5 @@
 #include "wifi_time.h"
+#include "alert_server.h"
 #include "app_config.h"
 #include "web_portal.h"
 #include "pcf85063.h"
@@ -20,7 +21,15 @@ static volatile bool s_wifi_connected = false;
 static volatile bool s_time_synced = false;
 static bool s_sntp_started = false;
 static int s_retry_count = 0;
+static char s_ip_str[20] = "0.0.0.0";
 #define WIFI_MAX_RETRY_BEFORE_PORTAL 5
+
+static void alert_server_launch_task(void *arg)
+{
+    (void)arg;
+    alert_server_start();
+    vTaskDelete(NULL);
+}
 
 static void portal_launch_task(void *arg)
 {
@@ -65,6 +74,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "STA associated with AP, waiting for DHCP IP...");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_connected = false;
         s_retry_count++;
@@ -76,10 +87,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             esp_wifi_connect();
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *ip_ev = (ip_event_got_ip_t *)event_data;
+        esp_ip4addr_ntoa(&ip_ev->ip_info.ip, s_ip_str, sizeof(s_ip_str));
         s_wifi_connected = true;
         s_retry_count = 0;
-        ESP_LOGI(TAG, "Wi-Fi connected with IP");
+        ESP_LOGI(TAG, "Wi-Fi connected! IP=%s (Webhook: http://%s/api/notify)", s_ip_str, s_ip_str);
         start_sntp_once();
+        xTaskCreate(alert_server_launch_task, "alert_srv", 4096, NULL, 3, NULL);
     }
 }
 
@@ -127,8 +141,24 @@ esp_err_t wifi_time_init(void)
     app_config_get(&app_cfg);
 
     if (strlen(app_cfg.wifi_ssid) == 0) {
-        ESP_LOGW(TAG, "No Wi-Fi SSID configured — starting SoftAP setup portal (http://192.168.4.1)");
+        ESP_LOGW(TAG, "No Wi-Fi SSID configured — starting SoftAP setup portal (http://192.168.1.4)");
         web_portal_start();
+        return ESP_OK;
+    }
+
+    return wifi_time_reconnect_sta();
+}
+
+esp_err_t wifi_time_reconnect_sta(void)
+{
+    app_config_t app_cfg;
+    app_config_get(&app_cfg);
+
+    s_wifi_connected = false;
+    s_retry_count = 0;
+
+    if (strlen(app_cfg.wifi_ssid) == 0) {
+        esp_wifi_stop();
         return ESP_OK;
     }
 
@@ -136,8 +166,12 @@ esp_err_t wifi_time_init(void)
     strncpy((char *)wifi_cfg.sta.ssid, app_cfg.wifi_ssid, sizeof(wifi_cfg.sta.ssid) - 1);
     strncpy((char *)wifi_cfg.sta.password, app_cfg.wifi_password, sizeof(wifi_cfg.sta.password) - 1);
     wifi_cfg.sta.threshold.authmode = strlen(app_cfg.wifi_password) > 0 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    wifi_cfg.sta.listen_interval = 1; // Wake every beacon (DTIM=1) so ARP/DHCP broadcasts are never missed
 
+    esp_wifi_stop();
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    // Force 802.11b/g/n for maximum compatibility with ISP routers (e.g. China Telecom gateways)
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
@@ -160,4 +194,11 @@ void wifi_time_get_local(struct tm *out_tm)
     time_t now = 0;
     time(&now);
     localtime_r(&now, out_tm);
+}
+
+void wifi_time_get_ip(char *out_buf, size_t out_sz)
+{
+    if (!out_buf || out_sz == 0) return;
+    strncpy(out_buf, s_wifi_connected ? s_ip_str : "Offline", out_sz - 1);
+    out_buf[out_sz - 1] = '\0';
 }

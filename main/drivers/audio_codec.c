@@ -244,6 +244,73 @@ void audio_play_alarm_chime(bool (*should_stop_cb)(void))
     }
 }
 
+esp_err_t audio_play_wav(const uint8_t *wav_data, size_t wav_len, bool (*should_stop_cb)(void))
+{
+    if (!s_ready || !s_tx_chan || !wav_data || wav_len <= 44) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Parse RIFF/WAVE header to locate 'fmt ' sample rate and 'data' chunk
+    uint32_t sample_rate = AUDIO_SAMPLE_RATE_HZ;
+    const uint8_t *pcm_ptr = wav_data + 44;
+    size_t pcm_bytes = wav_len - 44;
+
+    if (memcmp(wav_data, "RIFF", 4) == 0 && memcmp(wav_data + 8, "WAVE", 4) == 0) {
+        size_t pos = 12;
+        while (pos + 8 <= wav_len) {
+            uint32_t chunk_sz = (uint32_t)wav_data[pos + 4] |
+                                ((uint32_t)wav_data[pos + 5] << 8) |
+                                ((uint32_t)wav_data[pos + 6] << 16) |
+                                ((uint32_t)wav_data[pos + 7] << 24);
+            if (memcmp(wav_data + pos, "fmt ", 4) == 0 && pos + 16 <= wav_len) {
+                sample_rate = (uint32_t)wav_data[pos + 12] |
+                              ((uint32_t)wav_data[pos + 13] << 8) |
+                              ((uint32_t)wav_data[pos + 14] << 16) |
+                              ((uint32_t)wav_data[pos + 15] << 24);
+            } else if (memcmp(wav_data + pos, "data", 4) == 0) {
+                pcm_ptr = wav_data + pos + 8;
+                size_t avail = wav_len - (pos + 8);
+                pcm_bytes = chunk_sz < avail ? chunk_sz : avail;
+                break;
+            }
+            pos += 8 + chunk_sz + (chunk_sz & 1);
+        }
+    }
+
+    const int16_t *samples = (const int16_t *)pcm_ptr;
+    size_t total_samples = pcm_bytes / sizeof(int16_t);
+    int repeat_factor = (sample_rate > 0 && sample_rate <= 9000) ? 2 : 1; // 8kHz -> 16kHz 2x upsample
+
+    int16_t stereo_chunk[256 * 2];
+    audio_pa_enable(true);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    size_t idx = 0;
+    while (idx < total_samples) {
+        if (should_stop_cb && should_stop_cb()) {
+            break;
+        }
+        size_t out_frames = 0;
+        while (out_frames + (size_t)repeat_factor <= 256 && idx < total_samples) {
+            int16_t s = samples[idx++];
+            for (int r = 0; r < repeat_factor; r++) {
+                stereo_chunk[out_frames * 2] = s;
+                stereo_chunk[out_frames * 2 + 1] = s;
+                out_frames++;
+            }
+        }
+        size_t written = 0;
+        i2s_channel_write(s_tx_chan, stereo_chunk, out_frames * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(100));
+    }
+
+    // Brief silence flush to avoid pop when disabling amplifier
+    memset(stereo_chunk, 0, sizeof(stereo_chunk));
+    size_t written = 0;
+    i2s_channel_write(s_tx_chan, stereo_chunk, 64 * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(50));
+    audio_pa_enable(false);
+    return ESP_OK;
+}
+
 static void write_wav_header(uint8_t *hdr, uint32_t pcm_bytes)
 {
     uint32_t riff_size = pcm_bytes + 36;

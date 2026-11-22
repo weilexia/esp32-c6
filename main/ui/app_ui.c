@@ -1,15 +1,19 @@
 #include "app_ui.h"
-#include "ai_voice_alarm.h"
-#include "alarm_manager.h"
+#include "alert_server.h"
+#include "app_config.h"
 #include "axp2101.h"
+#include "ble_ancs.h"
 #include "board_pins.h"
+#include "deepseek_service.h"
 #include "gfx.h"
+#include "lcd_st7789.h"
 #include "touch_cst816d.h"
 #include "weather_service.h"
 #include "web_portal.h"
 #include "wifi_time.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
@@ -18,454 +22,709 @@
 static const char *TAG = "app_ui";
 
 typedef enum {
-    PAGE_HOME = 0,
-    PAGE_CALENDAR,
-    PAGE_ALARMS,
-    PAGE_AI_VOICE,
-    PAGE_COUNT
+    PAGE_OVERVIEW = 0,  // DeepSeek Usage Deck (CC Switch style: ring + 3 stacked cards)
+    PAGE_TOKENS,        // DeepSeek detailed token & balance breakdown
+    PAGE_ALERTS,        // Clock, weather & system alerts
+    PAGE_SYSTEM,        // Network, brightness power-save & hotspot trigger
+    PAGE_DETAIL,        // Single alert detail view
 } ui_page_t;
 
-static ui_page_t s_page = PAGE_HOME;
-static bool s_dirty = true;
-static bool s_was_ringing = false;
-static int s_cal_year = 2026;
-static int s_cal_month = 11; // 1..12
-static int s_last_sec = -1;
-static int s_last_min = -1;
-static ai_voice_state_t s_last_ai_state = AI_VOICE_IDLE;
+#define MAIN_PAGE_COUNT 4
+#define DIM_BACKLIGHT_PCT 5
+
+static ui_page_t s_page = PAGE_OVERVIEW;
+static bool s_full_redraw = true;
+static alert_record_t s_detail_rec = {0};
+
+// Rendered state cache for zero-flicker differential partial refresh
+static int s_rendered_min = -1;
+static int s_rendered_bat = -999;
+static bool s_rendered_wifi = false;
+static bool s_rendered_ap = false;
+static deepseek_usage_t s_rendered_ds = {0};
+static bool s_rendered_ds_valid = false;
+static uint32_t s_rendered_alert_total = 0xFFFFFFFF;
+static bool s_rendered_weather_valid = false;
+static int s_rendered_weather_temp = -999;
+static uint8_t s_rendered_bl = 0;
+static uint16_t s_rendered_dim = 0xFFFF;
+static int s_poll_div = 0;
+
+// Brightness & auto-dim power saving
+static uint8_t s_brightness = 80;
+static uint16_t s_auto_dim_sec = 60;
+static int64_t s_last_activity_ms = 0;
+static bool s_is_dimmed = false;
+
 static bool s_prev_pressed = false;
 static uint16_t s_touch_start_x = 0;
 static uint16_t s_touch_start_y = 0;
+
 static bool s_prev_boot_btn = false;
 static int s_boot_press_ticks = 0;
 static bool s_boot_long_fired = false;
+
 static bool s_was_portal = false;
 static bool s_portal_dismissed = false;
 
-static const char *DOW_NAMES[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+static bool s_was_alert = false;
+static uint32_t s_last_alert_seq = 0;
 
-static int days_in_month(int year, int month)
+static uint32_t s_last_wx_seq = 0;
+static bool s_wx_showing = false;
+static int s_wx_ticks_left = 0;
+static ble_ancs_msg_t s_wx_msg = {0};
+
+static int64_t now_ms(void)
 {
-    static const int dim[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    int d = dim[(month - 1) % 12];
-    if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) {
-        d = 29;
+    return esp_timer_get_time() / 1000;
+}
+
+static void wake_backlight(void)
+{
+    s_last_activity_ms = now_ms();
+    if (s_is_dimmed) {
+        s_is_dimmed = false;
+        lcd_st7789_set_backlight(s_brightness);
     }
-    return d;
 }
 
-static int first_weekday_of_month(int year, int month)
+static void set_brightness_and_save(uint8_t pct)
 {
-    struct tm t = {0};
-    t.tm_year = year - 1900;
-    t.tm_mon = month - 1;
-    t.tm_mday = 1;
-    mktime(&t);
-    return t.tm_wday; // 0=Sun..6=Sat
+    if (pct < 10) pct = 10;
+    if (pct > 100) pct = 100;
+    s_brightness = pct;
+    s_is_dimmed = false;
+    s_last_activity_ms = now_ms();
+    lcd_st7789_set_backlight(s_brightness);
+    app_config_set_display(s_brightness, s_auto_dim_sec);
 }
 
-static void draw_status_bar(void)
+static void cycle_auto_dim_and_save(void)
 {
-    gfx_fill_rect(12, 8, 216, 20, COL_BG);
+    if (s_auto_dim_sec == 30) s_auto_dim_sec = 60;
+    else if (s_auto_dim_sec == 60) s_auto_dim_sec = 120;
+    else if (s_auto_dim_sec == 120) s_auto_dim_sec = 0;
+    else s_auto_dim_sec = 30;
+    s_last_activity_ms = now_ms();
+    app_config_set_display(s_brightness, s_auto_dim_sec);
+}
 
-    // Wi-Fi status
-    bool wifi = wifi_time_is_connected();
-    gfx_draw_text(16, 12, wifi ? "WiFi" : "Off ", wifi ? COL_GREEN : COL_MUTED, COL_BG, 1);
+static uint16_t level_color(alert_level_t lvl)
+{
+    if (lvl == ALERT_LEVEL_ERROR) return COL_RED;
+    if (lvl == ALERT_LEVEL_WARN)  return COL_AMBER;
+    return COL_CYAN;
+}
 
-    // Active alarm badge
-    int ac = alarm_manager_active_count();
-    char abuf[16];
-    snprintf(abuf, sizeof(abuf), "AL:%d", ac);
-    gfx_draw_text_centered(120, 12, abuf, ac > 0 ? COL_AMBER : COL_MUTED, COL_BG, 1);
+static const char *level_name(alert_level_t lvl)
+{
+    if (lvl == ALERT_LEVEL_ERROR) return "严重告警";
+    if (lvl == ALERT_LEVEL_WARN)  return "系统预警";
+    return "系统通知";
+}
 
-    // Battery percentage from AXP2101
+// === Partial-friendly Top-Right Wi-Fi Status ===
+static void draw_header_wifi_status(void)
+{
+    bool online = wifi_time_is_connected();
+    bool ap_on = web_portal_is_active();
+    uint16_t st_col = ap_on ? COL_AMBER : (online ? COL_NEON_GREEN : COL_RED);
+    const char *st_txt = ap_on ? "AP MODE" : (online ? "ONLINE" : "OFFLINE");
+
+    gfx_fill_rect(160, 10, 74, 18, COL_BG);
+    gfx_draw_wifi_icon(162, 12, st_col, COL_BG);
+    gfx_draw_text(182, 15, st_txt, st_col, COL_BG, 1);
+
+    s_rendered_wifi = online;
+    s_rendered_ap = ap_on;
+}
+
+// === Usage Deck Header (CC Switch Style) ===
+static void draw_deck_header(const char *section_title, const char *right_tag)
+{
+    // Left neon-green badge "DS"
+    gfx_fill_round_rect(10, 8, 24, 24, 6, COL_NEON_GREEN);
+    gfx_draw_text_centered(22, 16, "DS", COL_BG, COL_NEON_GREEN, 1);
+
+    // Brand Title + Subtitle
+    gfx_draw_text(40, 10, "DEEPSEEK", COL_NEON_GREEN, COL_BG, 1);
+    gfx_draw_text(40, 22, "USAGE DECK", COL_MUTED, COL_BG, 1);
+
+    draw_header_wifi_status();
+
+    // Sub-header row
+    gfx_draw_text(10, 42, section_title, COL_NEON_GREEN, COL_BG, 1);
+    int rlen = (int)strlen(right_tag) * 6;
+    gfx_draw_text(230 - rlen, 42, right_tag, COL_MUTED, COL_BG, 1);
+}
+
+// === Partial-friendly Bottom Time Update ===
+static void draw_bottom_time_partial(const struct tm *now)
+{
+    char tbuf[16];
+    snprintf(tbuf, sizeof(tbuf), "%02d:%02d", now->tm_hour & 0xFF, now->tm_min & 0xFF);
+    gfx_draw_text(58, 260, tbuf, COL_MUTED, COL_BG, 1);
+    s_rendered_min = now->tm_min;
+}
+
+// === Usage Deck Bottom Bar: HOME pill + Time + 4 Dots + SET Button ===
+static void draw_deck_bottom_bar(const struct tm *now, int active_dot)
+{
+    const int bar_y = 252;
+    gfx_fill_rect(0, bar_y - 2, 240, 34, COL_BG);
+
+    // Left: Neon-green HOME pill
+    gfx_fill_round_rect(8, bar_y, 44, 24, 8, COL_NEON_GREEN);
+    gfx_draw_text_centered(30, bar_y + 8, "HOME", COL_BG, COL_NEON_GREEN, 1);
+
+    draw_bottom_time_partial(now);
+
+    // Center: 4 pagination dots
+    const int dot_x0 = 102;
+    for (int i = 0; i < MAIN_PAGE_COUNT; i++) {
+        uint16_t col = (i == active_dot) ? COL_NEON_GREEN : COL_BORDER;
+        gfx_fill_circle(dot_x0 + i * 12, bar_y + 12, (i == active_dot) ? 3 : 2, col);
+    }
+
+    // Right: Crisp Settings / Hotspot Button ("设置", generous padding inside 62x24 pill)
+    gfx_fill_round_rect(168, bar_y, 62, 24, 8, COL_CARD);
+    gfx_draw_round_rect(168, bar_y, 62, 24, 8, COL_NEON_GREEN);
+    gfx_draw_utf8_centered(199, bar_y + 4, "设置", COL_NEON_GREEN, COL_CARD);
+}
+
+// Draw token count cleanly: anti-aliased digits + crisp 5x7 unit suffix (avoids 10px 'M' crop)
+static void draw_token_value(int x, int y, uint64_t tokens, uint16_t fg, uint16_t bg)
+{
+    char num[16];
+    const char *unit = "";
+    if (tokens >= 1000000ULL) {
+        snprintf(num, sizeof(num), "%.2f", (double)tokens / 1000000.0);
+        unit = "M";
+    } else if (tokens >= 10000ULL) {
+        snprintf(num, sizeof(num), "%.1f", (double)tokens / 1000.0);
+        unit = "K";
+    } else if (tokens >= 1000ULL) {
+        snprintf(num, sizeof(num), "%.2f", (double)tokens / 1000.0);
+        unit = "K";
+    } else {
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)tokens);
+    }
+    gfx_draw_utf8(x, y, num, fg, bg);
+    if (unit[0]) {
+        int nw = gfx_measure_utf8(num);
+        gfx_draw_text(x + nw + 2, y + 6, unit, COL_NEON_GREEN, bg, 1);
+    }
+}
+
+// === Page 0: OVERVIEW — Partial Data Update (Zero Flicker!) ===
+static void draw_overview_data_partial(const deepseek_usage_t *ds, int bat, bool force_ring)
+{
+    // 1. Circular Progress Ring + Center Text
+    float ring_pct = 0.0f;
+    const char *ring_label = "WAIT";
+    char ring_num[12] = "--";
+
+    if (ds->calls > 0) {
+        ring_pct = 100.0f * (float)(ds->calls - ds->errors) / (float)ds->calls;
+        ring_label = "SUCCESS";
+        if (ring_pct >= 99.95f) snprintf(ring_num, sizeof(ring_num), "100");
+        else snprintf(ring_num, sizeof(ring_num), "%.1f", ring_pct);
+    } else if (ds->balance_valid) {
+        float budget = ds->daily_budget > 0.01f ? ds->daily_budget : 20.0f;
+        float rem_ratio = 1.0f - (ds->today_cost / budget);
+        if (rem_ratio < 0.0f) rem_ratio = 0.0f;
+        if (rem_ratio > 1.0f) rem_ratio = 1.0f;
+        ring_pct = rem_ratio * 100.0f;
+        ring_label = ds->is_available ? "BUDGET" : "EMPTY";
+        if (ring_pct >= 99.95f) snprintf(ring_num, sizeof(ring_num), "100");
+        else snprintf(ring_num, sizeof(ring_num), "%.1f", ring_pct);
+    } else {
+        ring_label = ds->status_text[0] ? ds->status_text : "WAIT";
+    }
+
+    uint16_t ring_col = COL_NEON_GREEN;
+    if (ds->calls > 0 && ring_pct < 90.0f) ring_col = COL_ORANGE;
+    else if (ds->balance_valid && !ds->is_available) ring_col = COL_RED;
+    else if (ds->balance_valid && ring_pct < 20.0f) ring_col = COL_ORANGE;
+
+    if (force_ring) {
+        const int rcx = 64, rcy = 144;
+        // Clear strictly inside inner radius (r=46 < r_inner=49) so we NEVER bite into the ring!
+        gfx_fill_circle(rcx, rcy, 46, COL_BG);
+        gfx_draw_ring_arc(rcx, rcy, 55, 49, ring_pct / 100.0f, ring_col, COL_RING_TRACK, COL_BG);
+
+        if (strcmp(ring_num, "--") == 0) {
+            gfx_draw_big_num_centered(rcx, rcy - 26, "--", COL_MUTED, COL_BG);
+        } else {
+            gfx_draw_big_num_centered(rcx, rcy - 26, ring_num, COL_WHITE, COL_BG);
+        }
+        gfx_draw_text_centered(rcx, rcy + 13, "%", ring_col, COL_BG, 1);
+        gfx_draw_text_centered(rcx, rcy + 26, ring_label, COL_MUTED, COL_BG, 1);
+    }
+
+    // 2. Right 3 Cards — Update ONLY the inner value boxes!
+    const int cx = 130;
+
+    // Card 1 Value: TOKENS
+    gfx_fill_rect(cx + 6, 66, 88, 38, COL_CARD);
+    gfx_draw_text(cx + 8, 68, ds->tokens_estimated ? "TOKENS (EST)" : "TOKENS", COL_MUTED, COL_CARD, 1);
+    if (ds->total_tokens > 0 || ds->calls == 0) {
+        draw_token_value(cx + 8, 84, ds->total_tokens, COL_WHITE, COL_CARD);
+    } else {
+        char call_buf[20];
+        snprintf(call_buf, sizeof(call_buf), "%lu", (unsigned long)ds->calls);
+        gfx_draw_utf8(cx + 8, 84, call_buf, COL_WHITE, COL_CARD);
+    }
+
+    // Card 2 Value: BALANCE (currency in label, pure ASCII number — no missing '¥' glyph!)
+    gfx_fill_rect(cx + 6, 124, 88, 38, COL_CARD);
+    if (ds->balance_valid) {
+        char blbl[20];
+        snprintf(blbl, sizeof(blbl), "BAL (%s)", ds->currency[0] ? ds->currency : "CNY");
+        gfx_draw_text(cx + 8, 126, blbl, COL_MUTED, COL_CARD, 1);
+        char bal_buf[20];
+        snprintf(bal_buf, sizeof(bal_buf), "%.2f", ds->total_balance);
+        uint16_t bcol = (ds->total_balance < 5.0f) ? COL_ORANGE : COL_CYAN;
+        gfx_draw_utf8(cx + 8, 142, bal_buf, bcol, COL_CARD);
+    } else {
+        gfx_draw_text(cx + 8, 126, "ERRORS", COL_MUTED, COL_CARD, 1);
+        char err_buf[16];
+        snprintf(err_buf, sizeof(err_buf), "%lu", (unsigned long)ds->errors);
+        gfx_draw_utf8(cx + 8, 142, err_buf, ds->errors > 0 ? COL_ORANGE : COL_NEON_GREEN, COL_CARD);
+    }
+
+    // Card 3 Value: TODAY COST (RMB)
+    gfx_fill_rect(cx + 6, 182, 88, 38, COL_CARD);
+    gfx_draw_text(cx + 8, 184, "TODAY (RMB)", COL_MUTED, COL_CARD, 1);
+    char cost_buf[20];
+    snprintf(cost_buf, sizeof(cost_buf), "%.2f", ds->today_cost);
+    gfx_draw_utf8(cx + 8, 200, cost_buf, COL_WHITE, COL_CARD);
+
+    // 3. Compact Meta Strip
+    gfx_fill_rect(8, 234, 224, 12, COL_BG);
+    char meta[48];
+    if (bat >= 0) {
+        snprintf(meta, sizeof(meta), "CALL:%lu  ERR:%lu  BAT %d%%",
+                 (unsigned long)ds->calls, (unsigned long)ds->errors, bat);
+    } else {
+        snprintf(meta, sizeof(meta), "CALL:%lu  ERR:%lu  USB",
+                 (unsigned long)ds->calls, (unsigned long)ds->errors);
+    }
+    gfx_draw_text_centered(120, 236, meta, COL_MUTED, COL_BG, 1);
+
+    s_rendered_ds = *ds;
+    s_rendered_ds_valid = true;
+    s_rendered_bat = bat;
+}
+
+// === Page 0: OVERVIEW (Full Frame) ===
+static void draw_page_overview_full(const struct tm *now)
+{
+    deepseek_usage_t ds = {0};
+    deepseek_service_get_usage(&ds);
+
+    gfx_fill_screen(COL_BG);
+    draw_deck_header("OVERVIEW", "TODAY");
+
+    // Static card shells drawn once
+    const int cx = 130, cw = 100, ch = 52;
+    const int cys[3] = {60, 118, 176};
+    for (int i = 0; i < 3; i++) {
+        gfx_fill_round_rect(cx, cys[i], cw, ch, 10, COL_CARD);
+        gfx_draw_round_rect(cx, cys[i], cw, ch, 10, COL_BORDER);
+    }
+
+    draw_overview_data_partial(&ds, axp2101_get_battery_percent(), true);
+    draw_deck_bottom_bar(now, 0);
+}
+
+// === Page 1: TOKENS — Partial Data Update ===
+static void draw_tokens_data_partial(const deepseek_usage_t *ds)
+{
+    // Top Balance Value Area
+    gfx_fill_rect(16, 80, 208, 24, COL_CARD);
+    char bal_s[32];
+    if (ds->balance_valid) {
+        snprintf(bal_s, sizeof(bal_s), "%s %.2f", ds->currency, ds->total_balance);
+        gfx_draw_utf8(20, 84, bal_s, COL_NEON_GREEN, COL_CARD);
+
+        char sub_s[32];
+        snprintf(sub_s, sizeof(sub_s), "赠:%.1f 充:%.1f", ds->granted_balance, ds->topped_up_balance);
+        int sw = gfx_measure_utf8(sub_s);
+        gfx_draw_utf8(222 - sw, 84, sub_s, COL_MUTED, COL_CARD);
+    } else {
+        gfx_draw_utf8(20, 84, "未配置 API Key", COL_AMBER, COL_CARD);
+        gfx_draw_text(162, 88, "TAP SET", COL_NEON_GREEN, COL_CARD, 1);
+    }
+
+    // 2x2 Metric Value Areas
+    char call_str[16], err_str[16];
+    snprintf(call_str, sizeof(call_str), "%lu", (unsigned long)ds->calls);
+    snprintf(err_str, sizeof(err_str), "%lu", (unsigned long)ds->errors);
+
+    const int gx[2] = {10, 124};
+    const int gy[2] = {118, 174};
+
+    // Prompt & Completion tokens with crisp unit suffix
+    gfx_fill_rect(gx[0] + 6, gy[0] + 22, 94, 22, COL_CARD);
+    draw_token_value(gx[0] + 8, gy[0] + 24, ds->prompt_tokens, COL_CYAN, COL_CARD);
+
+    gfx_fill_rect(gx[1] + 6, gy[0] + 22, 94, 22, COL_CARD);
+    draw_token_value(gx[1] + 8, gy[0] + 24, ds->completion_tokens, COL_PURPLE, COL_CARD);
+
+    // Calls & Errors
+    gfx_fill_rect(gx[0] + 6, gy[1] + 22, 94, 22, COL_CARD);
+    gfx_draw_utf8(gx[0] + 8, gy[1] + 24, call_str, COL_WHITE, COL_CARD);
+
+    gfx_fill_rect(gx[1] + 6, gy[1] + 22, 94, 22, COL_CARD);
+    gfx_draw_utf8(gx[1] + 8, gy[1] + 24, err_str, ds->errors > 0 ? COL_ORANGE : COL_NEON_GREEN, COL_CARD);
+
+    s_rendered_ds = *ds;
+    s_rendered_ds_valid = true;
+}
+
+static void draw_page_tokens_full(const struct tm *now)
+{
+    deepseek_usage_t ds = {0};
+    deepseek_service_get_usage(&ds);
+
+    gfx_fill_screen(COL_BG);
+    draw_deck_header("TOKENS", ds.last_sync[0] ? ds.last_sync : "SYNC");
+
+    gfx_fill_round_rect(10, 58, 220, 54, 10, COL_CARD);
+    gfx_draw_round_rect(10, 58, 220, 54, 10, COL_BORDER);
+    gfx_draw_text(20, 66, "DEEPSEEK BALANCE", COL_MUTED, COL_CARD, 1);
+
+    const int gx[2] = {10, 124};
+    const int gy[2] = {118, 174};
+    const char *labels[4] = {"PROMPT TOKENS", "COMPLETION", "API CALLS", "ERRORS"};
+    for (int i = 0; i < 4; i++) {
+        int x = gx[i % 2];
+        int y = gy[i / 2];
+        gfx_fill_round_rect(x, y, 106, 50, 10, COL_CARD);
+        gfx_draw_round_rect(x, y, 106, 50, 10, COL_BORDER);
+        gfx_draw_text(x + 8, y + 8, labels[i], COL_MUTED, COL_CARD, 1);
+    }
+
+    draw_tokens_data_partial(&ds);
+    gfx_draw_text_centered(120, 234, "TAP SCREEN TO REFRESH", COL_MUTED, COL_BG, 1);
+    draw_deck_bottom_bar(now, 1);
+}
+
+// === Page 2: ALERTS (Clock, Weather & System Alerts) ===
+static void draw_page_alerts_full(const struct tm *now)
+{
+    gfx_fill_screen(COL_BG);
+    draw_deck_header("ALERTS", "MONITOR");
+
+    gfx_fill_round_rect(10, 58, 220, 52, 10, COL_CARD);
+    gfx_draw_round_rect(10, 58, 220, 52, 10, COL_BORDER);
+
+    char tbuf[16];
+    snprintf(tbuf, sizeof(tbuf), "%02d:%02d", now->tm_hour & 0xFF, now->tm_min & 0xFF);
+    gfx_draw_big_num(18, 66, tbuf, COL_WHITE, COL_CARD);
+
+    weather_data_t w = {0};
+    weather_service_get_data(&w);
+    s_rendered_weather_valid = w.valid;
+    s_rendered_weather_temp = (int)w.temp_c;
+    if (w.valid) {
+        char ws[24];
+        snprintf(ws, sizeof(ws), "%.0f° %s", w.temp_c, w.desc);
+        gfx_draw_utf8(142, 66, ws, COL_AMBER, COL_CARD);
+        gfx_draw_utf8(142, 86, w.city, COL_MUTED, COL_CARD);
+    } else {
+        gfx_draw_utf8(142, 76, "天气离线", COL_MUTED, COL_CARD);
+    }
+
+    alert_stats_t st = {0};
+    alert_server_get_stats(&st);
+    s_rendered_alert_total = st.total;
+
+    alert_record_t list[3];
+    int total = alert_server_get_history(list, 3);
+    if (total == 0) {
+        gfx_fill_round_rect(10, 118, 220, 118, 10, COL_CARD);
+        gfx_draw_round_rect(10, 118, 220, 118, 10, COL_BORDER);
+        gfx_draw_utf8_centered(120, 156, "系统运行正常", COL_NEON_GREEN, COL_CARD);
+        gfx_draw_utf8_centered(120, 180, "暂无告警记录", COL_MUTED, COL_CARD);
+    } else {
+        for (int i = 0; i < total; i++) {
+            int y = 118 + i * 40;
+            gfx_fill_round_rect(10, y, 220, 36, 8, COL_CARD);
+            gfx_draw_round_rect(10, y, 220, 36, 8, COL_BORDER);
+            gfx_fill_round_rect(15, y + 6, 4, 24, 2, level_color(list[i].level));
+            gfx_draw_text(24, y + 5, list[i].time_str, COL_MUTED, COL_CARD, 1);
+            gfx_draw_utf8(172, y + 2, list[i].acked ? "已确认" : "未处理",
+                          list[i].acked ? COL_NEON_GREEN : COL_RED, COL_CARD);
+            gfx_draw_utf8_wrap(24, y + 17, 196, 1, 16, list[i].title, COL_WHITE, COL_CARD);
+        }
+    }
+
+    draw_deck_bottom_bar(now, 2);
+}
+
+// === Page 3: SYSTEM — Partial Brightness & Power-Save Update (Zero Flicker!) ===
+static void draw_system_brightness_partial(void)
+{
+    // Brightness header row (inside brightness card y=126..196)
+    gfx_fill_rect(18, 132, 204, 20, COL_CARD);
+
+    char btxt[24];
+    snprintf(btxt, sizeof(btxt), "亮度 %u%%", (unsigned)s_brightness);
+    gfx_draw_utf8(20, 133, btxt, COL_WHITE, COL_CARD);
+
+    // Auto-dim power-save pill on right
+    char dtxt[20];
+    if (s_auto_dim_sec == 0) snprintf(dtxt, sizeof(dtxt), "常亮模式");
+    else if (s_auto_dim_sec >= 120) snprintf(dtxt, sizeof(dtxt), "省电:%um", (unsigned)(s_auto_dim_sec / 60));
+    else snprintf(dtxt, sizeof(dtxt), "省电:%us", (unsigned)s_auto_dim_sec);
+
+    uint16_t dcol = (s_auto_dim_sec > 0) ? COL_NEON_GREEN : COL_MUTED;
+    gfx_fill_round_rect(136, 130, 86, 22, 6, COL_CARD_ALT);
+    gfx_draw_utf8_centered(179, 133, dtxt, dcol, COL_CARD_ALT);
+
+    // Slider bar track (x=54..186, y=166, w=132, h=14)
+    const int bx = 54, by = 166, bw = 132, bh = 14;
+    gfx_fill_round_rect(bx, by, bw, bh, 6, COL_RING_TRACK);
+    int fill_w = (bw * (int)s_brightness) / 100;
+    if (fill_w < 12) fill_w = 12;
+    gfx_fill_round_rect(bx, by, fill_w, bh, 6, COL_NEON_GREEN);
+
+    s_rendered_bl = s_brightness;
+    s_rendered_dim = s_auto_dim_sec;
+}
+
+static void draw_page_system_full(const struct tm *now)
+{
+    app_config_t cfg;
+    app_config_get(&cfg);
+
+    char ip_s[20];
+    wifi_time_get_ip(ip_s, sizeof(ip_s));
+
+    gfx_fill_screen(COL_BG);
+    draw_deck_header("SYSTEM", "POWER");
+
+    // Compact Network & Device Info Card (y=56..118)
+    gfx_fill_round_rect(10, 56, 220, 62, 10, COL_CARD);
+    gfx_draw_round_rect(10, 56, 220, 62, 10, COL_BORDER);
+
+    char line[48];
+    snprintf(line, sizeof(line), "Wi-Fi: %s", cfg.wifi_ssid[0] ? cfg.wifi_ssid : "未配置");
+    gfx_draw_utf8_wrap(18, 62, 204, 1, 18, line, COL_WHITE, COL_CARD);
+
+    snprintf(line, sizeof(line), "IP: %s", wifi_time_is_connected() ? ip_s : "未连接");
+    gfx_draw_utf8(18, 82, line, wifi_time_is_connected() ? COL_NEON_GREEN : COL_RED, COL_CARD);
+
     int bat = axp2101_get_battery_percent();
     bool chg = axp2101_is_charging();
-    char bbuf[16];
-    if (bat >= 0) {
-        snprintf(bbuf, sizeof(bbuf), "%d%%%s", bat, chg ? "+" : "");
-    } else {
-        snprintf(bbuf, sizeof(bbuf), "USB");
-    }
-    gfx_draw_text(182, 12, bbuf, (bat >= 0 && bat < 20) ? COL_RED : COL_CYAN, COL_BG, 1);
-    gfx_draw_hline(14, 28, 212, COL_BORDER);
+    if (bat >= 0) snprintf(line, sizeof(line), "电量:%d%%%s", bat, chg ? "+" : "");
+    else snprintf(line, sizeof(line), "USB供电");
+    int bw = gfx_measure_utf8(line);
+    gfx_draw_utf8(222 - bw, 82, line, COL_MUTED, COL_CARD);
+
+    snprintf(line, sizeof(line), "DeepSeek Key: %s",
+             (cfg.deepseek_api_key[0] || cfg.ai_api_key[0]) ? "已配置" : "未配置");
+    gfx_draw_utf8(18, 100, line,
+                  (cfg.deepseek_api_key[0] || cfg.ai_api_key[0]) ? COL_CYAN : COL_AMBER, COL_CARD);
+
+    // Brightness & Power-Saving Control Card (y=124..198)
+    gfx_fill_round_rect(10, 124, 220, 74, 10, COL_CARD);
+    gfx_draw_round_rect(10, 124, 220, 74, 10, COL_BORDER);
+
+    // [-] and [+] buttons (static shells)
+    gfx_fill_round_rect(18, 159, 30, 28, 8, COL_CARD_ALT);
+    gfx_draw_text_centered(33, 169, "-", COL_WHITE, COL_CARD_ALT, 1);
+
+    gfx_fill_round_rect(192, 159, 30, 28, 8, COL_CARD_ALT);
+    gfx_draw_text_centered(207, 169, "+", COL_WHITE, COL_CARD_ALT, 1);
+
+    draw_system_brightness_partial();
+
+    // Prominent Hotspot Launch Button (y=204..242)
+    gfx_fill_round_rect(10, 204, 220, 38, 10, COL_NEON_GREEN);
+    gfx_draw_utf8_centered(120, 215, "开启配网热点 (192.168.1.4)", COL_BG, COL_NEON_GREEN);
+
+    draw_deck_bottom_bar(now, 3);
 }
 
-static void draw_bottom_nav(const char *b0, const char *b1, const char *b2, int active_idx)
-{
-    const int y = 236;
-    const int h = 34;
-    const int w = 66;
-    const int xs[3] = {14, 87, 160};
-    const char *labels[3] = {b0, b1, b2};
-
-    for (int i = 0; i < 3; i++) {
-        uint16_t bg = (i == active_idx) ? COL_BLUE : COL_CARD_ALT;
-        uint16_t fg = (i == active_idx) ? COL_WHITE : COL_CYAN;
-        gfx_fill_round_rect(xs[i], y, w, h, 8, bg);
-        gfx_draw_text_centered(xs[i] + w / 2, y + 13, labels[i], fg, bg, 1);
-    }
-}
-
-static void draw_home_clock_partial(const struct tm *now)
-{
-    char tbuf[32];
-    snprintf(tbuf, sizeof(tbuf), "%02d:%02d", now->tm_hour & 0xFF, now->tm_min & 0xFF);
-    gfx_draw_text(28, 44, tbuf, COL_WHITE, COL_CARD, 4);
-
-    char sbuf[16];
-    snprintf(sbuf, sizeof(sbuf), ":%02d", now->tm_sec & 0xFF);
-    gfx_draw_text(176, 60, sbuf, COL_CYAN, COL_CARD, 2);
-}
-
-static void draw_page_home(const struct tm *now)
+// === Single Alert Detail ===
+static void draw_page_detail(void)
 {
     gfx_fill_screen(COL_BG);
-    draw_status_bar();
+    uint16_t col = level_color(s_detail_rec.level);
+    gfx_fill_round_rect(12, 14, 96, 26, 8, col);
+    gfx_draw_utf8_centered(60, 19, level_name(s_detail_rec.level),
+                           s_detail_rec.level == ALERT_LEVEL_WARN ? COL_BG : COL_WHITE, col);
+    gfx_draw_utf8(120, 19, s_detail_rec.time_str, COL_MUTED, COL_BG);
 
-    // Clock Card
-    gfx_fill_round_rect(12, 34, 216, 78, 12, COL_CARD);
-    draw_home_clock_partial(now);
+    gfx_fill_round_rect(12, 48, 216, 178, 12, COL_CARD);
+    gfx_draw_round_rect(12, 48, 216, 178, 12, COL_BORDER);
+    gfx_draw_utf8_wrap(22, 58, 196, 1, 18, s_detail_rec.title, COL_CYAN, COL_CARD);
+    gfx_draw_hline(22, 80, 196, COL_BORDER);
+    gfx_draw_utf8_wrap(22, 90, 196, 5, 22, s_detail_rec.message, COL_WHITE, COL_CARD);
 
-    char dbuf[48];
-    snprintf(dbuf, sizeof(dbuf), "%04d-%02d-%02d  %s",
-             (now->tm_year + 1900) % 10000, (now->tm_mon + 1) & 0xFF, now->tm_mday & 0xFF,
-             DOW_NAMES[now->tm_wday % 7]);
-    gfx_draw_text_centered(120, 90, dbuf, COL_MUTED, COL_CARD, 1);
-
-    // Weather Card
-    weather_data_t w = {0};
-    weather_service_get_data(&w);
-    gfx_fill_round_rect(12, 120, 216, 108, 12, COL_CARD);
-    gfx_draw_text(22, 128, w.city, COL_CYAN, COL_CARD, 1);
-    gfx_draw_text(168, 128, "[Refr]", COL_MUTED, COL_CARD, 1);
-
-    if (w.valid) {
-        gfx_draw_weather_icon(48, 168, w.weather_code, COL_CARD);
-        char temp_s[24];
-        snprintf(temp_s, sizeof(temp_s), "%.0fC", w.temp_c);
-        gfx_draw_text(86, 148, temp_s, COL_WHITE, COL_CARD, 3);
-        gfx_draw_text(86, 178, w.desc, COL_AMBER, COL_CARD, 1);
-
-        char detail[64];
-        snprintf(detail, sizeof(detail), "H:%.0f L:%.0f  RH:%d%%",
-                 w.daily_max[0], w.daily_min[0], w.humidity_pct);
-        gfx_draw_text(22, 206, detail, COL_MUTED, COL_CARD, 1);
-    } else {
-        gfx_draw_weather_icon(48, 168, 1, COL_CARD);
-        gfx_draw_text(86, 156, "-- C", COL_WHITE, COL_CARD, 3);
-        gfx_draw_text(86, 188, wifi_time_is_connected() ? "Updating..." : "No Wi-Fi", COL_MUTED, COL_CARD, 1);
-    }
-
-    draw_bottom_nav("Cal", "AI Mic", "Alarm", -1);
+    gfx_fill_round_rect(12, 236, 216, 36, 10, COL_CARD_ALT);
+    gfx_draw_round_rect(12, 236, 216, 36, 10, COL_BORDER);
+    gfx_draw_utf8_centered(120, 246, "返回告警列表", COL_WHITE, COL_CARD_ALT);
 }
 
-static void draw_page_calendar(const struct tm *now)
+// === Active Voice Alert Overlay ===
+static void draw_alert_overlay(const alert_state_t *st)
+{
+    uint16_t hdr_col = level_color(st->current.level);
+    uint16_t hdr_fg  = (st->current.level == ALERT_LEVEL_WARN) ? COL_BG : COL_WHITE;
+
+    gfx_fill_screen(COL_BG);
+    gfx_fill_round_rect(12, 12, 216, 40, 12, hdr_col);
+    gfx_draw_utf8_centered(120, 24,
+                           st->current.has_voice ? "告警 · 语音循环播报中" : level_name(st->current.level),
+                           hdr_fg, hdr_col);
+
+    gfx_fill_round_rect(12, 60, 216, 158, 14, COL_CARD);
+    gfx_draw_round_rect(12, 60, 216, 158, 14, hdr_col);
+    gfx_draw_utf8(22, 68, st->current.time_str, COL_MUTED, COL_CARD);
+    gfx_draw_utf8_wrap(22, 88, 196, 1, 18, st->current.title, COL_CYAN, COL_CARD);
+    gfx_draw_hline(22, 110, 196, COL_BORDER);
+    gfx_draw_utf8_wrap(22, 118, 196, 4, 22, st->current.message, COL_WHITE, COL_CARD);
+
+    gfx_fill_round_rect(12, 226, 216, 44, 12, COL_NEON_GREEN);
+    gfx_draw_utf8_centered(120, 240, "取消语音提醒 (点此 / BOOT)", COL_BG, COL_NEON_GREEN);
+}
+
+static void draw_wechat_overlay(const ble_ancs_msg_t *msg)
 {
     gfx_fill_screen(COL_BG);
-    draw_status_bar();
+    gfx_fill_round_rect(12, 14, 216, 36, 10, COL_NEON_GREEN);
+    gfx_draw_utf8_centered(120, 24, "微信消息", COL_BG, COL_NEON_GREEN);
 
-    // Month header with < and > buttons
-    gfx_fill_round_rect(14, 34, 34, 22, 6, COL_CARD_ALT);
-    gfx_draw_text_centered(31, 41, "<", COL_WHITE, COL_CARD_ALT, 1);
+    gfx_fill_round_rect(12, 58, 216, 166, 14, COL_CARD);
+    gfx_draw_round_rect(12, 58, 216, 166, 14, COL_BORDER);
+    gfx_draw_utf8_wrap(22, 68, 196, 1, 18, msg->title[0] ? msg->title : "微信", COL_CYAN, COL_CARD);
+    gfx_draw_hline(22, 90, 196, COL_BORDER);
+    gfx_draw_utf8_wrap(22, 100, 196, 5, 22, msg->message, COL_WHITE, COL_CARD);
 
-    char hdr[32];
-    snprintf(hdr, sizeof(hdr), "%04d - %02d", s_cal_year % 10000, s_cal_month & 0xFF);
-    gfx_draw_text_centered(120, 38, hdr, COL_WHITE, COL_BG, 2);
-
-    gfx_fill_round_rect(192, 34, 34, 22, 6, COL_CARD_ALT);
-    gfx_draw_text_centered(209, 41, ">", COL_WHITE, COL_CARD_ALT, 1);
-
-    // Weekday header
-    static const char *wd[7] = {"Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"};
-    for (int i = 0; i < 7; i++) {
-        uint16_t col = (i == 0 || i == 6) ? COL_AMBER : COL_MUTED;
-        gfx_draw_text(18 + i * 30, 62, wd[i], col, COL_BG, 1);
-    }
-    gfx_draw_hline(14, 73, 212, COL_BORDER);
-
-    // Calendar grid
-    int first_wd = first_weekday_of_month(s_cal_year, s_cal_month);
-    int dim = days_in_month(s_cal_year, s_cal_month);
-    int today_y = now->tm_year + 1900;
-    int today_m = now->tm_mon + 1;
-    int today_d = now->tm_mday;
-
-    for (int d = 1; d <= dim; d++) {
-        int idx = first_wd + (d - 1);
-        int col = idx % 7;
-        int row = idx / 7;
-        int cx = 14 + col * 30;
-        int cy = 78 + row * 19;
-
-        bool is_today = (s_cal_year == today_y && s_cal_month == today_m && d == today_d);
-        uint16_t bg = is_today ? COL_CYAN : COL_BG;
-        uint16_t fg = is_today ? COL_BG : ((col == 0 || col == 6) ? COL_AMBER : COL_WHITE);
-        if (is_today) {
-            gfx_fill_round_rect(cx, cy - 2, 26, 15, 5, bg);
-        }
-        char ds[16];
-        snprintf(ds, sizeof(ds), "%2d", d);
-        gfx_draw_text(cx + 6, cy + 1, ds, fg, bg, 1);
-    }
-
-    // 3-day Forecast Strip
-    weather_data_t w = {0};
-    weather_service_get_data(&w);
-    gfx_fill_round_rect(12, 198, 216, 30, 8, COL_CARD);
-    if (w.valid) {
-        char fbuf[64];
-        snprintf(fbuf, sizeof(fbuf), "D0:%.0f/%.0f D1:%.0f/%.0f D2:%.0f/%.0f",
-                 w.daily_min[0], w.daily_max[0],
-                 w.daily_min[1], w.daily_max[1],
-                 w.daily_min[2], w.daily_max[2]);
-        gfx_draw_text_centered(120, 209, fbuf, COL_CYAN, COL_CARD, 1);
-    } else {
-        gfx_draw_text_centered(120, 209, "3-Day Forecast (Online)", COL_MUTED, COL_CARD, 1);
-    }
-
-    draw_bottom_nav("Home", "AI Mic", "Alarm", -1);
+    gfx_fill_round_rect(20, 234, 200, 36, 10, COL_CARD_ALT);
+    gfx_draw_utf8_centered(120, 244, "点击关闭", COL_WHITE, COL_CARD_ALT);
 }
 
-static void draw_page_alarms(void)
-{
-    gfx_fill_screen(COL_BG);
-    draw_status_bar();
-
-    gfx_draw_text(16, 36, "Alarms", COL_WHITE, COL_BG, 2);
-    gfx_fill_round_rect(164, 34, 62, 22, 6, COL_PURPLE);
-    gfx_draw_text_centered(195, 41, "+AI", COL_WHITE, COL_PURPLE, 1);
-
-    alarm_entry_t list[ALARM_MAX_COUNT];
-    alarm_manager_get_all(list, ALARM_MAX_COUNT);
-
-    int shown = 0;
-    for (int i = 0; i < ALARM_MAX_COUNT && shown < 5; i++) {
-        if (!list[i].used) continue;
-        int y = 62 + shown * 33;
-        gfx_fill_round_rect(12, y, 216, 29, 8, COL_CARD);
-
-        char tbuf[32];
-        snprintf(tbuf, sizeof(tbuf), "%02u:%02u %s", list[i].hour, list[i].minute,
-                 list[i].repeat_daily ? "D" : "1");
-        gfx_draw_text(20, y + 6, tbuf, list[i].enabled ? COL_WHITE : COL_MUTED, COL_CARD, 2);
-
-        // Toggle pill
-        uint16_t tbg = list[i].enabled ? COL_GREEN : COL_CARD_ALT;
-        gfx_fill_round_rect(152, y + 5, 38, 19, 6, tbg);
-        gfx_draw_text_centered(171, y + 11, list[i].enabled ? "ON" : "OFF", COL_WHITE, tbg, 1);
-
-        // Delete X button
-        gfx_fill_round_rect(196, y + 5, 24, 19, 6, COL_RED);
-        gfx_draw_text_centered(208, y + 11, "X", COL_WHITE, COL_RED, 1);
-        shown++;
-    }
-
-    if (shown == 0) {
-        gfx_draw_text_centered(120, 128, "No alarms set", COL_MUTED, COL_BG, 2);
-        gfx_draw_text_centered(120, 154, "Tap +AI or +5m below", COL_CYAN, COL_BG, 1);
-    }
-
-    draw_bottom_nav("Home", "Cal", "+5m", -1);
-}
-
-static void draw_page_ai_voice(void)
-{
-    gfx_fill_screen(COL_BG);
-    draw_status_bar();
-
-    ai_voice_status_t st = {0};
-    ai_voice_alarm_get_status(&st);
-
-    gfx_draw_text_centered(120, 36, "AI Voice Alarm", COL_WHITE, COL_BG, 2);
-
-    uint16_t mic_col = COL_CYAN;
-    const char *mic_lbl = "TAP";
-    if (st.state == AI_VOICE_LISTENING) {
-        mic_col = COL_RED;
-        mic_lbl = "REC";
-    } else if (st.state == AI_VOICE_THINKING) {
-        mic_col = COL_AMBER;
-        mic_lbl = "...";
-    } else if (st.state == AI_VOICE_DONE) {
-        mic_col = COL_GREEN;
-        mic_lbl = "OK!";
-    }
-
-    gfx_fill_circle(120, 102, 36, mic_col);
-    gfx_draw_text_centered(120, 94, mic_lbl, COL_BG, mic_col, 2);
-
-    // Status & Reply card
-    gfx_fill_round_rect(14, 148, 212, 44, 10, COL_CARD);
-    gfx_draw_text_centered(120, 156, st.reply_text[0] ? st.reply_text : "Tap Mic to Speak", COL_WHITE, COL_CARD, 1);
-    if (st.heard_text[0]) {
-        char trunc[32];
-        strncpy(trunc, st.heard_text, 31);
-        trunc[31] = '\0';
-        gfx_draw_text_centered(120, 174, trunc, COL_MUTED, COL_CARD, 1);
-    }
-
-    // Quick timer pills (+5m / +15m / +30m)
-    const char *q[3] = {"+5m", "+15m", "+30m"};
-    for (int i = 0; i < 3; i++) {
-        int qx = 14 + i * 73;
-        gfx_fill_round_rect(qx, 200, 66, 26, 8, COL_CARD_ALT);
-        gfx_draw_text_centered(qx + 33, 209, q[i], COL_AMBER, COL_CARD_ALT, 1);
-    }
-
-    draw_bottom_nav("Home", "Cal", "Alarm", -1);
-}
-
+// === SoftAP Wi-Fi Setup Hotspot Overlay (192.168.1.4) ===
 static void draw_portal_overlay(void)
 {
     gfx_fill_screen(COL_BG);
-    gfx_fill_round_rect(14, 18, 212, 36, 10, COL_BLUE);
-    gfx_draw_text_centered(120, 28, "Wi-Fi Setup", COL_WHITE, COL_BLUE, 2);
 
-    gfx_fill_round_rect(14, 66, 212, 134, 12, COL_CARD);
-    gfx_draw_text_centered(120, 78, "1. Connect Phone Wi-Fi:", COL_MUTED, COL_CARD, 1);
-    gfx_draw_text_centered(120, 96, web_portal_get_ap_ssid(), COL_CYAN, COL_CARD, 1);
+    gfx_fill_round_rect(12, 14, 216, 36, 10, COL_NEON_GREEN);
+    gfx_draw_utf8_centered(120, 24, "Wi-Fi 热点配网已开启", COL_BG, COL_NEON_GREEN);
 
-    gfx_draw_text_centered(120, 124, "2. Open in Browser:", COL_MUTED, COL_CARD, 1);
-    gfx_draw_text_centered(120, 142, "http://192.168.4.1", COL_AMBER, COL_CARD, 1);
+    gfx_fill_round_rect(12, 58, 216, 154, 14, COL_CARD);
+    gfx_draw_round_rect(12, 58, 216, 154, 14, COL_NEON_GREEN);
 
-    gfx_draw_text_centered(120, 174, "Set Wi-Fi & AI API Key", COL_GREEN, COL_CARD, 1);
+    gfx_draw_utf8_centered(120, 70, "1. 手机连接无密码热点:", COL_MUTED, COL_CARD);
+    gfx_draw_utf8_centered(120, 92, web_portal_get_ap_ssid(), COL_CYAN, COL_CARD);
 
-    gfx_fill_round_rect(26, 218, 188, 36, 10, COL_CARD_ALT);
-    gfx_draw_text_centered(120, 231, "Tap to Use Offline", COL_WHITE, COL_CARD_ALT, 1);
+    gfx_draw_utf8_centered(120, 122, "2. 手机浏览器访问:", COL_MUTED, COL_CARD);
+    char url[32];
+    snprintf(url, sizeof(url), "http://%s", web_portal_get_ap_ip());
+    gfx_draw_utf8_centered(120, 144, url, COL_AMBER, COL_CARD);
+
+    gfx_draw_utf8_centered(120, 174, "配置 Wi-Fi 账号密码及 Key", COL_NEON_GREEN, COL_CARD);
+    gfx_draw_utf8_centered(120, 192, "保存后设备将自动重启", COL_MUTED, COL_CARD);
+
+    gfx_fill_round_rect(16, 224, 208, 40, 10, COL_CARD_ALT);
+    gfx_draw_round_rect(16, 224, 208, 40, 10, COL_BORDER);
+    gfx_draw_utf8_centered(120, 236, "关闭热点并返回", COL_WHITE, COL_CARD_ALT);
 }
 
-static void draw_ringing_overlay(const alarm_entry_t *a)
+static void open_hotspot_portal(void)
 {
-    gfx_fill_screen(COL_BG);
-    gfx_fill_round_rect(16, 20, 208, 44, 12, COL_RED);
-    gfx_draw_text_centered(120, 34, "ALARM!", COL_WHITE, COL_RED, 2);
-
-    char tbuf[12];
-    snprintf(tbuf, sizeof(tbuf), "%02u:%02u", a->hour, a->minute);
-    gfx_draw_text_centered(120, 86, tbuf, COL_AMBER, COL_BG, 4);
-    gfx_draw_text_centered(120, 134, a->label, COL_WHITE, COL_BG, 2);
-
-    // Snooze & Dismiss buttons
-    gfx_fill_round_rect(18, 180, 96, 56, 12, COL_AMBER);
-    gfx_draw_text_centered(66, 202, "SNOOZE", COL_BG, COL_AMBER, 2);
-
-    gfx_fill_round_rect(126, 180, 96, 56, 12, COL_GREEN);
-    gfx_draw_text_centered(174, 202, "STOP", COL_BG, COL_GREEN, 2);
-}
-
-static void add_quick_minutes(int mins)
-{
-    struct tm now = {0};
-    wifi_time_get_local(&now);
-    int tot = now.tm_hour * 60 + now.tm_min + mins;
-    uint8_t h = (uint8_t)((tot / 60) % 24);
-    uint8_t m = (uint8_t)(tot % 60);
-    char lbl[24];
-    snprintf(lbl, sizeof(lbl), "Quick +%dm", mins);
-    alarm_manager_add(h, m, false, lbl);
+    s_portal_dismissed = false;
+    web_portal_start();
+    s_full_redraw = true;
 }
 
 static void handle_tap(uint16_t x, uint16_t y)
 {
-    alarm_entry_t ring_a = {0};
-    if (alarm_manager_is_ringing(&ring_a)) {
-        if (y >= 170) {
-            if (x < 120) {
-                alarm_manager_snooze(5);
-            } else {
-                alarm_manager_dismiss();
+    if (alert_server_get_state(NULL)) {
+        if (y >= 216) {
+            alert_server_stop();
+            s_full_redraw = true;
+        }
+        return;
+    }
+
+    if (s_page == PAGE_DETAIL) {
+        if (y >= 225) {
+            s_page = PAGE_ALERTS;
+            s_full_redraw = true;
+        }
+        return;
+    }
+
+    // Bottom Bar Actions (y >= 246)
+    if (y >= 246) {
+        if (x <= 72) {
+            if (s_page != PAGE_OVERVIEW) {
+                s_page = PAGE_OVERVIEW;
+                s_full_redraw = true;
             }
-            s_dirty = true;
+        } else if (x >= 152) {
+            open_hotspot_portal();
+        } else {
+            s_page = (ui_page_t)((s_page + 1) % MAIN_PAGE_COUNT);
+            s_full_redraw = true;
         }
         return;
     }
 
-    // Bottom nav dock (y >= 230)
-    if (y >= 230) {
-        int btn = (x < 82) ? 0 : (x < 156 ? 1 : 2);
-        if (s_page == PAGE_HOME) {
-            if (btn == 0) s_page = PAGE_CALENDAR;
-            else if (btn == 1) s_page = PAGE_AI_VOICE;
-            else s_page = PAGE_ALARMS;
-        } else if (s_page == PAGE_CALENDAR) {
-            if (btn == 0) s_page = PAGE_HOME;
-            else if (btn == 1) s_page = PAGE_AI_VOICE;
-            else s_page = PAGE_ALARMS;
-        } else if (s_page == PAGE_ALARMS) {
-            if (btn == 0) s_page = PAGE_HOME;
-            else if (btn == 1) s_page = PAGE_CALENDAR;
-            else add_quick_minutes(5);
-        } else if (s_page == PAGE_AI_VOICE) {
-            if (btn == 0) s_page = PAGE_HOME;
-            else if (btn == 1) s_page = PAGE_CALENDAR;
-            else s_page = PAGE_ALARMS;
-        }
-        s_dirty = true;
-        return;
-    }
-
-    // Per-page tap targets
-    if (s_page == PAGE_HOME) {
-        if (y >= 120 && y <= 228) {
+    // Page-specific taps
+    if (s_page == PAGE_OVERVIEW || s_page == PAGE_TOKENS) {
+        // Trigger async background API refresh — UI will update seamlessly with zero flicker when data arrives!
+        deepseek_service_request_refresh();
+    } else if (s_page == PAGE_ALERTS) {
+        if (y >= 58 && y <= 112) {
             weather_service_request_refresh();
-            s_dirty = true;
-        }
-    } else if (s_page == PAGE_CALENDAR) {
-        if (y >= 30 && y <= 60) {
-            if (x < 70) {
-                s_cal_month--;
-                if (s_cal_month < 1) { s_cal_month = 12; s_cal_year--; }
-                s_dirty = true;
-            } else if (x > 170) {
-                s_cal_month++;
-                if (s_cal_month > 12) { s_cal_month = 1; s_cal_year++; }
-                s_dirty = true;
+        } else if (y >= 118 && y < 240) {
+            int row = (y - 118) / 40;
+            alert_record_t list[3];
+            int total = alert_server_get_history(list, 3);
+            if (row >= 0 && row < total) {
+                s_detail_rec = list[row];
+                s_page = PAGE_DETAIL;
+                s_full_redraw = true;
             }
         }
-    } else if (s_page == PAGE_ALARMS) {
-        if (y >= 30 && y <= 58 && x >= 160) {
-            s_page = PAGE_AI_VOICE;
-            ai_voice_alarm_start_listening();
-            s_dirty = true;
-            return;
-        }
-        if (y >= 62 && y < 228) {
-            int row = (y - 62) / 33;
-            alarm_entry_t list[ALARM_MAX_COUNT];
-            alarm_manager_get_all(list, ALARM_MAX_COUNT);
-            int shown = 0;
-            for (int i = 0; i < ALARM_MAX_COUNT; i++) {
-                if (!list[i].used) continue;
-                if (shown == row) {
-                    if (x >= 194) {
-                        alarm_manager_delete(i);
-                    } else if (x >= 148) {
-                        alarm_manager_toggle(i);
-                    }
-                    s_dirty = true;
-                    break;
-                }
-                shown++;
+    } else if (s_page == PAGE_SYSTEM) {
+        if (y >= 124 && y <= 156 && x >= 130) {
+            // Toggle auto-dim power saving timeout (partial update only!)
+            cycle_auto_dim_and_save();
+            draw_system_brightness_partial();
+        } else if (y >= 155 && y <= 198) {
+            // Brightness [-] / slider / [+] (partial update only — zero flicker!)
+            if (x < 52) {
+                int nb = (int)s_brightness - 10;
+                set_brightness_and_save(nb < 10 ? 10 : (uint8_t)nb);
+            } else if (x > 188) {
+                int nb = (int)s_brightness + 10;
+                set_brightness_and_save(nb > 100 ? 100 : (uint8_t)nb);
+            } else {
+                // Direct tap on slider bar (x=54..186 -> 10%..100%)
+                int pct = 10 + ((int)(x - 54) * 90) / 132;
+                pct = ((pct + 5) / 10) * 10; // Snap to nearest 10%
+                if (pct < 10) pct = 10;
+                if (pct > 100) pct = 100;
+                set_brightness_and_save((uint8_t)pct);
             }
-        }
-    } else if (s_page == PAGE_AI_VOICE) {
-        if (y >= 60 && y <= 145) {
-            ai_voice_alarm_start_listening();
-            s_dirty = true;
-        } else if (y >= 198 && y <= 228) {
-            if (x < 84) add_quick_minutes(5);
-            else if (x < 156) add_quick_minutes(15);
-            else add_quick_minutes(30);
-            s_page = PAGE_ALARMS;
-            s_dirty = true;
+            draw_system_brightness_partial();
+        } else if (y >= 202 && y <= 244) {
+            open_hotspot_portal();
         }
     }
 }
 
 void app_ui_init(void)
 {
-    // Configure BOOT button (GPIO9, active-low) as quick AI voice / alarm dismiss trigger
     gpio_config_t btn_cfg = {
         .pin_bit_mask = (1ULL << BOARD_BTN_BOOT_GPIO),
         .mode = GPIO_MODE_INPUT,
@@ -475,61 +734,98 @@ void app_ui_init(void)
     };
     gpio_config(&btn_cfg);
 
-    struct tm now = {0};
-    wifi_time_get_local(&now);
-    s_cal_year = now.tm_year + 1900;
-    s_cal_month = now.tm_mon + 1;
-    s_dirty = true;
-    ESP_LOGI(TAG, "UI initialized (240x284 rounded-corner safe layout)");
+    app_config_t cfg;
+    app_config_get(&cfg);
+    s_brightness = (cfg.brightness >= 10 && cfg.brightness <= 100) ? cfg.brightness : 80;
+    s_auto_dim_sec = cfg.auto_dim_sec;
+    lcd_st7789_set_backlight(s_brightness);
+    s_last_activity_ms = now_ms();
+    s_is_dimmed = false;
+
+    s_full_redraw = true;
+    ESP_LOGI(TAG, "Usage Deck UI ready (zero-flicker partial refresh, brightness=%u%%, auto_dim=%us)",
+             (unsigned)s_brightness, (unsigned)s_auto_dim_sec);
 }
 
 void app_ui_tick(void)
 {
-    // 1. Hardware BOOT button handling (active-low: short press = AI/dismiss, long press 2.5s = Wi-Fi Setup)
+    // 1. Hardware BOOT button
     bool boot_pressed = (gpio_get_level(BOARD_BTN_BOOT_GPIO) == 0);
     if (boot_pressed) {
+        if (s_is_dimmed) {
+            wake_backlight();
+            s_prev_boot_btn = true;
+            s_boot_long_fired = true; // Consume wake press
+            return;
+        }
+        s_last_activity_ms = now_ms();
         s_boot_press_ticks++;
         if (s_boot_press_ticks >= 85 && !s_boot_long_fired) {
             s_boot_long_fired = true;
-            s_portal_dismissed = false;
-            web_portal_start();
-            s_dirty = true;
+            open_hotspot_portal();
         }
     } else if (s_prev_boot_btn) {
         if (!s_boot_long_fired) {
-            if (alarm_manager_is_ringing(NULL)) {
-                alarm_manager_dismiss();
+            if (alert_server_get_state(NULL)) {
+                alert_server_stop();
+            } else if (s_wx_showing) {
+                s_wx_showing = false;
+                s_wx_ticks_left = 0;
             } else if (web_portal_is_active() && !s_portal_dismissed) {
+                web_portal_stop();
                 s_portal_dismissed = true;
             } else {
-                s_page = PAGE_AI_VOICE;
-                ai_voice_alarm_start_listening();
+                s_page = (ui_page_t)((s_page + 1) % MAIN_PAGE_COUNT);
             }
-            s_dirty = true;
+            s_full_redraw = true;
         }
         s_boot_press_ticks = 0;
         s_boot_long_fired = false;
     }
     s_prev_boot_btn = boot_pressed;
 
-    // 2. Touch & swipe handling
+    // 2. Touch & horizontal swipe handling
     touch_point_t pt = {0};
     touch_cst816d_read(&pt);
     if (pt.pressed && !s_prev_pressed) {
+        if (s_is_dimmed) {
+            // First touch wakes the screen cleanly without triggering underlying buttons
+            wake_backlight();
+            s_prev_pressed = false;
+            return;
+        }
+        s_last_activity_ms = now_ms();
         s_touch_start_x = pt.x;
         s_touch_start_y = pt.y;
     } else if (!pt.pressed && s_prev_pressed) {
-        if (web_portal_is_active() && !s_portal_dismissed && !alarm_manager_is_ringing(NULL)) {
-            s_portal_dismissed = true;
-            s_dirty = true;
+        s_last_activity_ms = now_ms();
+        if (alert_server_get_state(NULL)) {
+            handle_tap(s_touch_start_x, s_touch_start_y);
+        } else if (s_wx_showing) {
+            s_wx_showing = false;
+            s_wx_ticks_left = 0;
+            s_full_redraw = true;
+        } else if (web_portal_is_active() && !s_portal_dismissed) {
+            if (s_touch_start_y >= 216) {
+                web_portal_stop();
+                s_portal_dismissed = true;
+                s_full_redraw = true;
+            }
         } else {
             int dx = (int)pt.x - (int)s_touch_start_x;
-            if (dx > 45 && !alarm_manager_is_ringing(NULL)) {
-                s_page = (ui_page_t)((s_page + PAGE_COUNT - 1) % PAGE_COUNT);
-                s_dirty = true;
-            } else if (dx < -45 && !alarm_manager_is_ringing(NULL)) {
-                s_page = (ui_page_t)((s_page + 1) % PAGE_COUNT);
-                s_dirty = true;
+            if (dx < -45) {
+                if (s_page < MAIN_PAGE_COUNT - 1) {
+                    s_page = (ui_page_t)(s_page + 1);
+                    s_full_redraw = true;
+                }
+            } else if (dx > 45) {
+                if (s_page == PAGE_DETAIL) {
+                    s_page = PAGE_ALERTS;
+                    s_full_redraw = true;
+                } else if (s_page > 0) {
+                    s_page = (ui_page_t)(s_page - 1);
+                    s_full_redraw = true;
+                }
             } else {
                 handle_tap(s_touch_start_x, s_touch_start_y);
             }
@@ -537,64 +833,153 @@ void app_ui_tick(void)
     }
     s_prev_pressed = pt.pressed;
 
-    // 3. Alarm ringing overlay state transitions
-    alarm_entry_t ring_a = {0};
-    bool ringing = alarm_manager_is_ringing(&ring_a);
-    if (ringing != s_was_ringing) {
-        s_was_ringing = ringing;
-        s_dirty = true;
+    // 3. Active Voice Alert Overlay (wakes screen automatically!)
+    alert_state_t alert_st = {0};
+    bool alert_on = alert_server_get_state(&alert_st);
+    if (alert_on != s_was_alert || (alert_on && alert_st.seq != s_last_alert_seq)) {
+        s_was_alert = alert_on;
+        s_last_alert_seq = alert_st.seq;
+        if (alert_on) wake_backlight();
+        s_full_redraw = true;
     }
-    if (ringing) {
-        if (s_dirty) {
-            draw_ringing_overlay(&ring_a);
-            s_dirty = false;
+    if (alert_on) {
+        if (s_full_redraw) {
+            draw_alert_overlay(&alert_st);
+            s_full_redraw = false;
         }
         return;
     }
 
-    // 3b. SoftAP Wi-Fi setup portal overlay
+    // 4. iPhone WeChat notification popup
+    ble_ancs_msg_t latest_wx = {0};
+    if (ble_ancs_get_latest_msg(&latest_wx) && latest_wx.seq != s_last_wx_seq) {
+        s_last_wx_seq = latest_wx.seq;
+        s_wx_msg = latest_wx;
+        s_wx_showing = true;
+        s_wx_ticks_left = 500;
+        wake_backlight();
+        s_full_redraw = true;
+    }
+    if (s_wx_showing) {
+        if (s_full_redraw) {
+            draw_wechat_overlay(&s_wx_msg);
+            s_full_redraw = false;
+        }
+        if (--s_wx_ticks_left <= 0) {
+            s_wx_showing = false;
+            s_full_redraw = true;
+        }
+        return;
+    }
+
+    // 5. SoftAP Wi-Fi setup hotspot overlay (192.168.1.4)
     bool portal_on = web_portal_is_active();
     if (portal_on != s_was_portal) {
         s_was_portal = portal_on;
         if (portal_on) {
             s_portal_dismissed = false;
+            wake_backlight();
         }
-        s_dirty = true;
+        s_full_redraw = true;
     }
     if (portal_on && !s_portal_dismissed) {
-        if (s_dirty) {
+        if (s_full_redraw) {
             draw_portal_overlay();
-            s_dirty = false;
+            s_full_redraw = false;
         }
         return;
     }
 
-    // 4. AI Voice state change triggers redraw
-    ai_voice_status_t ai_st = {0};
-    ai_voice_alarm_get_status(&ai_st);
-    if (ai_st.state != s_last_ai_state) {
-        s_last_ai_state = ai_st.state;
-        if (s_page == PAGE_AI_VOICE) {
-            s_dirty = true;
+    // 6. Auto-Dim Power Saving Check
+    if (s_auto_dim_sec > 0 && !s_is_dimmed) {
+        if ((now_ms() - s_last_activity_ms) >= (int64_t)s_auto_dim_sec * 1000) {
+            s_is_dimmed = true;
+            lcd_st7789_set_backlight(DIM_BACKLIGHT_PCT);
         }
     }
 
-    // 5. Periodic clock & screen refresh
+    // 7. Full Redraw ONLY on page transition / overlay exit
     struct tm now = {0};
     wifi_time_get_local(&now);
-    if (s_dirty || now.tm_min != s_last_min) {
-        s_last_min = now.tm_min;
-        s_last_sec = now.tm_sec;
-        s_dirty = false;
-        switch (s_page) {
-            case PAGE_HOME:     draw_page_home(&now); break;
-            case PAGE_CALENDAR: draw_page_calendar(&now); break;
-            case PAGE_ALARMS:   draw_page_alarms(); break;
-            case PAGE_AI_VOICE: draw_page_ai_voice(); break;
-            default: break;
+    if (s_full_redraw) {
+        s_full_redraw = false;
+        if (s_page == PAGE_OVERVIEW)      draw_page_overview_full(&now);
+        else if (s_page == PAGE_TOKENS)   draw_page_tokens_full(&now);
+        else if (s_page == PAGE_ALERTS)   draw_page_alerts_full(&now);
+        else if (s_page == PAGE_SYSTEM)   draw_page_system_full(&now);
+        else                              draw_page_detail();
+        return;
+    }
+
+    // 8. Zero-Flicker Differential Partial Refresh (check ~3 times/sec, redraw ONLY changed elements!)
+    if (++s_poll_div < 10) {
+        return;
+    }
+    s_poll_div = 0;
+
+    if (s_page == PAGE_DETAIL) {
+        return;
+    }
+
+    // 8a. Bottom timestamp (only when minute changes)
+    if (now.tm_min != s_rendered_min) {
+        draw_bottom_time_partial(&now);
+        if (s_page == PAGE_ALERTS) {
+            char tbuf[16];
+            snprintf(tbuf, sizeof(tbuf), "%02d:%02d", now.tm_hour & 0xFF, now.tm_min & 0xFF);
+            gfx_draw_big_num(18, 66, tbuf, COL_WHITE, COL_CARD);
         }
-    } else if (s_page == PAGE_HOME && now.tm_sec != s_last_sec) {
-        s_last_sec = now.tm_sec;
-        draw_home_clock_partial(&now);
+    }
+
+    // 8b. Top-right Wi-Fi status (only when connection state changes)
+    bool cur_wifi = wifi_time_is_connected();
+    bool cur_ap = web_portal_is_active();
+    if (cur_wifi != s_rendered_wifi || cur_ap != s_rendered_ap) {
+        draw_header_wifi_status();
+    }
+
+    // 8c. Page-specific differential data updates
+    if (s_page == PAGE_OVERVIEW) {
+        deepseek_usage_t ds = {0};
+        deepseek_service_get_usage(&ds);
+        int bat = axp2101_get_battery_percent();
+        bool ds_changed = (!s_rendered_ds_valid || memcmp(&ds, &s_rendered_ds, sizeof(ds)) != 0);
+        if (ds_changed || bat != s_rendered_bat) {
+            // Only redraw the circular ring if ring-affecting metrics actually changed
+            bool ring_changed = !s_rendered_ds_valid ||
+                                ds.calls != s_rendered_ds.calls ||
+                                ds.errors != s_rendered_ds.errors ||
+                                ds.balance_valid != s_rendered_ds.balance_valid ||
+                                ds.is_available != s_rendered_ds.is_available ||
+                                ds.today_cost != s_rendered_ds.today_cost ||
+                                ds.daily_budget != s_rendered_ds.daily_budget ||
+                                strcmp(ds.status_text, s_rendered_ds.status_text) != 0;
+            draw_overview_data_partial(&ds, bat, ring_changed);
+        }
+    } else if (s_page == PAGE_TOKENS) {
+        deepseek_usage_t ds = {0};
+        deepseek_service_get_usage(&ds);
+        if (!s_rendered_ds_valid || memcmp(&ds, &s_rendered_ds, sizeof(ds)) != 0) {
+            draw_tokens_data_partial(&ds);
+        }
+    } else if (s_page == PAGE_ALERTS) {
+        alert_stats_t st = {0};
+        alert_server_get_stats(&st);
+        weather_data_t w = {0};
+        weather_service_get_data(&w);
+        if (st.total != s_rendered_alert_total ||
+            w.valid != s_rendered_weather_valid ||
+            (w.valid && (int)w.temp_c != s_rendered_weather_temp)) {
+            draw_page_alerts_full(&now);
+        }
+    } else if (s_page == PAGE_SYSTEM) {
+        // Sync if brightness was changed remotely via HTTP /api/brightness or serial 'bl'
+        uint8_t hw_bl = lcd_st7789_get_backlight();
+        if (!s_is_dimmed && hw_bl >= 10 && hw_bl != s_brightness) {
+            s_brightness = hw_bl;
+        }
+        if (s_brightness != s_rendered_bl || s_auto_dim_sec != s_rendered_dim) {
+            draw_system_brightness_partial();
+        }
     }
 }

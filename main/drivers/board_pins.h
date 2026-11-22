@@ -12,7 +12,7 @@
 // === LCD (ST7789P, 240x284, RAM 240x320) ===
 #define BOARD_LCD_WIDTH         240
 #define BOARD_LCD_HEIGHT        284
-#define BOARD_LCD_Y_OFFSET      20
+#define BOARD_LCD_Y_OFFSET      0   // Waveshare 1.83" ST7789P rotation-0 row offset is 0 (row_offset2=36 for 180 deg)
 #define BOARD_LCD_DC_GPIO       3
 #define BOARD_LCD_RST_GPIO      4   // Shared with Touch RST
 #define BOARD_LCD_CS_GPIO       5

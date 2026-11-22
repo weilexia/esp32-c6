@@ -20,17 +20,17 @@ static volatile bool s_force_refresh = false;
 
 const char *weather_code_to_desc(int wmo_code)
 {
-    if (wmo_code == 0) return "Clear Sky";
-    if (wmo_code <= 2) return "Partly Cloudy";
-    if (wmo_code == 3) return "Overcast";
-    if (wmo_code == 45 || wmo_code == 48) return "Foggy";
-    if (wmo_code >= 51 && wmo_code <= 57) return "Drizzle";
-    if (wmo_code >= 61 && wmo_code <= 67) return "Rainy";
-    if (wmo_code >= 71 && wmo_code <= 77) return "Snowy";
-    if (wmo_code >= 80 && wmo_code <= 82) return "Showers";
-    if (wmo_code >= 85 && wmo_code <= 86) return "Snow Showers";
-    if (wmo_code >= 95) return "Thunderstorm";
-    return "Cloudy";
+    if (wmo_code == 0) return "晴朗";
+    if (wmo_code <= 2) return "多云";
+    if (wmo_code == 3) return "阴天";
+    if (wmo_code == 45 || wmo_code == 48) return "有雾";
+    if (wmo_code >= 51 && wmo_code <= 57) return "毛毛雨";
+    if (wmo_code >= 61 && wmo_code <= 67) return "降雨";
+    if (wmo_code >= 71 && wmo_code <= 77) return "降雪";
+    if (wmo_code >= 80 && wmo_code <= 82) return "阵雨";
+    if (wmo_code >= 85 && wmo_code <= 86) return "阵雪";
+    if (wmo_code >= 95) return "雷阵雨";
+    return "多云";
 }
 
 // Lightweight zero-dependency JSON number extractor

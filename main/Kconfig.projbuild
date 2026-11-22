@@ -3,13 +3,13 @@ menu "Smart Calendar, Weather & AI Voice Alarm"
     menu "Wi-Fi & Time Configuration"
         config APP_WIFI_SSID
             string "Wi-Fi SSID"
-            default ""
+            default "weilexia"
             help
                 Wi-Fi network name (SSID). Leave empty to run offline (RTC + local calendar/NLP alarms still work).
 
         config APP_WIFI_PASSWORD
             string "Wi-Fi Password"
-            default ""
+            default "123123123"
             help
                 Wi-Fi password (WPA2/WPA3).
 
@@ -23,19 +23,19 @@ menu "Smart Calendar, Weather & AI Voice Alarm"
     menu "Weather Configuration (Open-Meteo, No API Key Needed)"
         config APP_WEATHER_CITY
             string "City Name (Display)"
-            default "Beijing"
+            default "天津滨海"
             help
-                City name displayed on the weather screen (ASCII recommended for built-in bitmap font).
+                City name displayed on the weather screen (supports Chinese UTF-8).
 
         config APP_WEATHER_LAT
             string "Latitude"
-            default "39.9042"
+            default "39.0030"
             help
                 Latitude in decimal degrees for Open-Meteo weather query.
 
         config APP_WEATHER_LON
             string "Longitude"
-            default "116.4074"
+            default "117.7109"
             help
                 Longitude in decimal degrees for Open-Meteo weather query.
 
@@ -78,6 +78,21 @@ menu "Smart Calendar, Weather & AI Voice Alarm"
             default "Qwen/Qwen2.5-7B-Instruct"
             help
                 LLM model name (e.g. Qwen/Qwen2.5-7B-Instruct, deepseek-ai/DeepSeek-V3, gpt-4o-mini).
+    endmenu
+
+    menu "DeepSeek Usage Monitor Configuration"
+        config APP_DEEPSEEK_API_KEY
+            string "DeepSeek API Key"
+            default ""
+            help
+                DeepSeek API Key (sk-...) for polling https://api.deepseek.com/user/balance.
+                Can also be configured at runtime via the SoftAP web portal at http://192.168.1.4.
+
+        config APP_DEEPSEEK_DAILY_BUDGET
+            string "Daily Budget (RMB)"
+            default "20.0"
+            help
+                Daily spending budget in RMB used for the circular progress indicator when no webhook call stats are pushed.
     endmenu
 
 endmenu

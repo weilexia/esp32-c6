@@ -22,7 +22,7 @@
   "idf.openOcdConfigs": [
     "board/esp32c6-ftdi.cfg"
   ],
-  "idf.port": "COM3",
+  "idf.port": "COM5",
   "idf.currentSetup": "D:\\ESP\\.espressif\\v6.1.1\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32c6"

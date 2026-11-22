@@ -7,10 +7,27 @@
 #include "esp_lcd_panel_st7789.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "lcd_st7789";
 static esp_lcd_panel_handle_t s_panel = NULL;
+static SemaphoreHandle_t s_trans_done_sem = NULL;
+static uint8_t s_backlight_pct = 85;
+
+static bool IRAM_ATTR on_lcd_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
+                                              esp_lcd_panel_io_event_data_t *edata,
+                                              void *user_ctx)
+{
+    (void)panel_io;
+    (void)edata;
+    (void)user_ctx;
+    BaseType_t hp_woken = pdFALSE;
+    if (s_trans_done_sem) {
+        xSemaphoreGiveFromISR(s_trans_done_sem, &hp_woken);
+    }
+    return hp_woken == pdTRUE;
+}
 
 #define LCD_SPI_CLK_HZ        (40 * 1000 * 1000)
 #define LCD_BL_LEDC_TIMER     LEDC_TIMER_0
@@ -66,9 +83,15 @@ esp_err_t lcd_st7789_set_backlight(uint8_t percent)
     if (percent > 100) {
         percent = 100;
     }
+    s_backlight_pct = percent;
     uint32_t duty = (1023 * percent) / 100;
     ledc_set_duty(LCD_BL_LEDC_MODE, LCD_BL_LEDC_CHANNEL, duty);
     return ledc_update_duty(LCD_BL_LEDC_MODE, LCD_BL_LEDC_CHANNEL);
+}
+
+uint8_t lcd_st7789_get_backlight(void)
+{
+    return s_backlight_pct;
 }
 
 esp_err_t lcd_st7789_init(void)
@@ -96,6 +119,10 @@ esp_err_t lcd_st7789_init(void)
 
     board_shared_lcd_touch_reset();
 
+    if (!s_trans_done_sem) {
+        s_trans_done_sem = xSemaphoreCreateBinary();
+    }
+
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_spi_config_t io_cfg = {
         .dc_gpio_num = BOARD_LCD_DC_GPIO,
@@ -105,6 +132,7 @@ esp_err_t lcd_st7789_init(void)
         .lcd_param_bits = 8,
         .spi_mode = 0,
         .trans_queue_depth = 10,
+        .on_color_trans_done = on_lcd_color_trans_done,
     };
     err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)BOARD_SPI_HOST, &io_cfg, &io_handle);
     if (err != ESP_OK) {
@@ -143,5 +171,14 @@ esp_err_t lcd_st7789_draw_bitmap(int x_start, int y_start, int x_end, int y_end,
     if (!s_panel) {
         return ESP_ERR_INVALID_STATE;
     }
-    return esp_lcd_panel_draw_bitmap(s_panel, x_start, y_start, x_end, y_end, color_data);
+    // Clear any stale semaphore token before queuing DMA transfer
+    if (s_trans_done_sem) {
+        xSemaphoreTake(s_trans_done_sem, 0);
+    }
+    esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, x_start, y_start, x_end, y_end, color_data);
+    // Wait until SPI DMA finishes reading color_data so caller's shared s_tile_buf is never overwritten mid-transfer
+    if (err == ESP_OK && s_trans_done_sem) {
+        xSemaphoreTake(s_trans_done_sem, pdMS_TO_TICKS(100));
+    }
+    return err;
 }

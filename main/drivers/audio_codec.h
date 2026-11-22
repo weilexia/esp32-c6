@@ -21,6 +21,9 @@ void audio_play_beep_ok(void);
 void audio_play_beep_err(void);
 void audio_play_alarm_chime(bool (*should_stop_cb)(void));
 
+// Play 16-bit mono WAV (supports 16kHz native and 8kHz 2x upsampling), interruptible every 16ms
+esp_err_t audio_play_wav(const uint8_t *wav_data, size_t wav_len, bool (*should_stop_cb)(void));
+
 // Voice recording helper (ES7210 dual mic -> 16kHz 16-bit mono WAV in caller buffer)
 // Returns total WAV bytes written into wav_buf (including 44-byte RIFF header), or 0 on error.
 size_t audio_record_wav(uint8_t *wav_buf, size_t wav_buf_size, uint32_t max_ms, bool (*stop_cb)(void));
