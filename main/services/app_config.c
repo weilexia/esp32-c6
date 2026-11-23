@@ -87,6 +87,10 @@ esp_err_t app_config_init(void)
         if (nvs_get_u16(h, "dim_sec", &dim) == ESP_OK) {
             s_cfg.auto_dim_sec = dim;
         }
+        uint8_t mut = 0;
+        if (nvs_get_u8(h, "muted", &mut) == ESP_OK) {
+            s_cfg.muted = (mut != 0);
+        }
         nvs_close(h);
         ESP_LOGI(TAG, "Loaded runtime config (SSID='%s', DSKey=%s)",
                  s_cfg.wifi_ssid, s_cfg.deepseek_api_key[0] ? "set" : "empty");
@@ -134,6 +138,7 @@ esp_err_t app_config_save(const app_config_t *cfg)
     nvs_set_str(h, "ds_budget", s_cfg.deepseek_daily_budget);
     nvs_set_u8(h, "bl_pct", s_cfg.brightness);
     nvs_set_u16(h, "dim_sec", s_cfg.auto_dim_sec);
+    nvs_set_u8(h, "muted", s_cfg.muted ? 1 : 0);
     err = nvs_commit(h);
     xSemaphoreGive(s_mutex);
 
@@ -159,6 +164,23 @@ esp_err_t app_config_set_display(uint8_t brightness, uint16_t auto_dim_sec)
     if (err == ESP_OK) {
         nvs_set_u8(h, "bl_pct", brightness);
         nvs_set_u16(h, "dim_sec", auto_dim_sec);
+        err = nvs_commit(h);
+        nvs_close(h);
+    }
+    return err;
+}
+
+esp_err_t app_config_set_mute(bool muted)
+{
+    if (!s_mutex) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_cfg.muted = muted;
+    xSemaphoreGive(s_mutex);
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        nvs_set_u8(h, "muted", muted ? 1 : 0);
         err = nvs_commit(h);
         nvs_close(h);
     }

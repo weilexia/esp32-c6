@@ -65,12 +65,13 @@ void app_main(void)
     weather_service_start();
     deepseek_service_start();
 
-    // 5. Touch Dashboard UI Loop
+    // 5. Touch Dashboard UI Loop (raise priority so background tasks never stutter LVGL swipes)
+    vTaskPrioritySet(NULL, 4);
     app_ui_init();
     ESP_LOGI(TAG, "Dashboard ready. Type 'ip', 'test', 'stop', or 'setup' in monitor.");
 
     while (1) {
         app_ui_tick();
-        vTaskDelay(pdMS_TO_TICKS(30));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }

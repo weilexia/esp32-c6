@@ -15,8 +15,7 @@ idf_component_register(
         "services/wifi_time.c"
         "services/weather_service.c"
         "ui/font_cn16.c"
-        "ui/font_hd.c"
-        "ui/gfx.c"
+        "ui/lv_port.c"
         "ui/app_ui.c"
     INCLUDE_DIRS
         "."
@@ -43,4 +42,5 @@ idf_component_register(
         mbedtls
         lwip
         esp_timer
+        lvgl
 )

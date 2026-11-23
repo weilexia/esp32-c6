@@ -7,6 +7,7 @@
 #include "lcd_st7789.h"
 #include "web_portal.h"
 #include "wifi_time.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -18,7 +19,8 @@
 
 static const char *TAG = "alert_srv";
 
-#define ALERT_MAX_WAV_BYTES (96 * 1024) // Up to 6s @ 8kHz or 3s @ 16kHz 16-bit mono WAV
+#define ALERT_MAX_WAV_BYTES (512 * 1024) // Up to 512KB (buffered if fits in RAM, else streamed directly to I2S!)
+#define ALERT_BUF_MAX_BYTES (64 * 1024)
 
 static httpd_handle_t s_server = NULL;
 static SemaphoreHandle_t s_mutex = NULL;
@@ -31,6 +33,7 @@ static uint32_t s_next_id = 1;
 
 static volatile bool s_stop_flag = false;
 static volatile bool s_playback_running = false;
+static volatile bool s_repeat_loop = true;
 static uint8_t *s_wav_buf = NULL;
 static size_t s_wav_len = 0;
 
@@ -107,7 +110,7 @@ static void alert_playback_task(void *arg)
     (void)arg;
     s_playback_running = true;
 
-    // Continuously loop voice/chime reminder until user presses button/screen to cancel
+    // Play voice/chime reminder (loop until cancelled unless repeat=0)
     while (!s_stop_flag) {
         if (s_wav_buf && s_wav_len > 44) {
             audio_play_wav(s_wav_buf, s_wav_len, should_stop_playback);
@@ -115,7 +118,7 @@ static void alert_playback_task(void *arg)
             audio_play_alarm_chime(should_stop_playback);
         }
 
-        if (s_stop_flag) {
+        if (s_stop_flag || !s_repeat_loop) {
             break;
         }
         // Short 1.2s pause between voice reminders, checking cancel flag every 50ms
@@ -193,14 +196,15 @@ static esp_err_t handle_get_status(httpd_req_t *req)
     alert_stats_t stats = {0};
     alert_server_get_stats(&stats);
 
-    char resp[340];
+    char resp[360];
     snprintf(resp, sizeof(resp),
-             "{\"ok\":true,\"ip\":\"%s\",\"battery\":%d,\"charging\":%s,\"brightness\":%u,"
+             "{\"ok\":true,\"ip\":\"%s\",\"battery\":%d,\"charging\":%s,\"brightness\":%u,\"muted\":%s,"
              "\"alert_active\":%s,\"playing\":%s,\"total\":%lu,\"unacked\":%lu}",
              ip,
              axp2101_get_battery_percent(),
              axp2101_is_charging() ? "true" : "false",
              (unsigned)lcd_st7789_get_backlight(),
+             audio_is_muted() ? "true" : "false",
              st.active ? "true" : "false",
              s_playback_running ? "true" : "false",
              (unsigned long)stats.total,
@@ -251,13 +255,14 @@ static esp_err_t handle_post_alert_audio(httpd_req_t *req)
     if (len <= 44 || len > ALERT_MAX_WAV_BYTES) {
         httpd_resp_set_type(req, "application/json");
         httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_send(req, "{\"ok\":false,\"error\":\"WAV must be 45..98304 bytes (8kHz/16kHz 16-bit mono)\"}",
+        return httpd_resp_send(req, "{\"ok\":false,\"error\":\"WAV must be 45..524288 bytes (8kHz/16kHz 16-bit mono)\"}",
                                HTTPD_RESP_USE_STRLEN);
     }
 
     char lvl_s[16] = "error";
     char title[64] = "语音告警";
     char msg[192] = "收到新告警，请点击按钮停止播报";
+    bool repeat = true;
 
     size_t qlen = httpd_req_get_url_query_len(req);
     if (qlen > 0 && qlen < 512) {
@@ -273,32 +278,120 @@ static esp_err_t handle_post_alert_audio(httpd_req_t *req)
             if (httpd_query_key_value(qbuf, "message", tmp, sizeof(tmp)) == ESP_OK) {
                 url_decode(tmp, msg, sizeof(msg));
             }
+            if (httpd_query_key_value(qbuf, "repeat", tmp, sizeof(tmp)) == ESP_OK) {
+                if (strcmp(tmp, "0") == 0 || strcmp(tmp, "false") == 0) {
+                    repeat = false;
+                }
+            }
         }
         free(qbuf);
     }
 
     stop_current_playback();
+    s_repeat_loop = repeat;
 
-    uint8_t *wav = malloc((size_t)len);
-    if (!wav) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Low memory for WAV");
+    // Buffer in RAM only if WAV <= 64KB and >= 16KB contiguous headroom remains; otherwise stream directly to I2S!
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    uint8_t *wav = NULL;
+    if (len <= ALERT_BUF_MAX_BYTES && largest > (size_t)len + 16384) {
+        wav = malloc((size_t)len);
     }
 
-    int rtot = 0;
-    while (rtot < len) {
-        int r = httpd_req_recv(req, (char *)wav + rtot, len - rtot);
-        if (r <= 0) {
-            free(wav);
-            return ESP_FAIL;
+    if (wav) {
+        int rtot = 0;
+        while (rtot < len) {
+            int r = httpd_req_recv(req, (char *)wav + rtot, len - rtot);
+            if (r <= 0) {
+                free(wav);
+                return ESP_FAIL;
+            }
+            rtot += r;
         }
-        rtot += r;
+        trigger_alert(parse_level(lvl_s), title, msg, wav, (size_t)rtot);
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, "{\"ok\":true,\"mode\":\"buffered\"}", HTTPD_RESP_USE_STRLEN);
     }
 
-    // Always loop voice reminder until cancelled by button/screen
-    trigger_alert(parse_level(lvl_s), title, msg, wav, (size_t)rtot);
+    // Zero-RAM-allocation streaming mode: never returns 500 even for large WAVs with LVGL + Wi-Fi + BLE active!
+    ESP_LOGI(TAG, "Streaming %d-byte WAV alert directly to speaker (largest free block=%u)",
+             len, (unsigned)largest);
+
+    struct tm now = {0};
+    wifi_time_get_local(&now);
+    alert_record_t rec = {0};
+    rec.id = s_next_id++;
+    rec.level = parse_level(lvl_s);
+    snprintf(rec.time_str, sizeof(rec.time_str), "%02d:%02d:%02d",
+             now.tm_hour & 0xFF, now.tm_min & 0xFF, now.tm_sec & 0xFF);
+    strncpy(rec.title, title[0] ? title : "语音告警", sizeof(rec.title) - 1);
+    strncpy(rec.message, msg, sizeof(rec.message) - 1);
+    rec.acked = false;
+    rec.has_voice = true;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int move_n = s_history_count < ALERT_HISTORY_MAX ? s_history_count : (ALERT_HISTORY_MAX - 1);
+    if (move_n > 0) {
+        memmove(&s_history[1], &s_history[0], (size_t)move_n * sizeof(alert_record_t));
+    }
+    s_history[0] = rec;
+    if (s_history_count < ALERT_HISTORY_MAX) s_history_count++;
+    s_state.active = true;
+    s_state.seq++;
+    s_state.current = rec;
+    xSemaphoreGive(s_mutex);
+
+    uint8_t hdr[44];
+    int hgot = 0;
+    while (hgot < 44) {
+        int r = httpd_req_recv(req, (char *)hdr + hgot, 44 - hgot);
+        if (r <= 0) return ESP_FAIL;
+        hgot += r;
+    }
+    uint32_t sample_rate = AUDIO_SAMPLE_RATE_HZ;
+    if (memcmp(hdr, "RIFF", 4) == 0 && memcmp(hdr + 8, "WAVE", 4) == 0) {
+        sample_rate = (uint32_t)hdr[24] | ((uint32_t)hdr[25] << 8) |
+                      ((uint32_t)hdr[26] << 16) | ((uint32_t)hdr[27] << 24);
+    }
+
+    uint8_t chunk[1024];
+    int rem = len - 44;
+    uint8_t carry = 0;
+    bool has_carry = false;
+
+    s_stop_flag = false;
+    audio_stream_begin();
+    while (rem > 0) {
+        int want = rem < (int)sizeof(chunk) ? rem : (int)sizeof(chunk);
+        int r = httpd_req_recv(req, (char *)chunk, want);
+        if (r <= 0) break;
+        rem -= r;
+        if (s_stop_flag) continue;
+
+        int offset = 0;
+        if (has_carry && r > 0) {
+            int16_t s = (int16_t)((uint16_t)carry | ((uint16_t)chunk[0] << 8));
+            audio_stream_write_mono16(&s, 1, sample_rate);
+            offset = 1;
+            has_carry = false;
+        }
+        int avail = r - offset;
+        size_t n_samples = (size_t)(avail / 2);
+        if (n_samples > 0) {
+            audio_stream_write_mono16((const int16_t *)(chunk + offset), n_samples, sample_rate);
+        }
+        if (avail & 1) {
+            carry = chunk[r - 1];
+            has_carry = true;
+        }
+    }
+    audio_stream_end();
+
+    if (repeat && !s_stop_flag) {
+        xTaskCreate(alert_playback_task, "alert_play", 4096, NULL, 4, NULL);
+    }
 
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(req, "{\"ok\":true,\"mode\":\"stream\"}", HTTPD_RESP_USE_STRLEN);
 }
 
 static bool json_get_u64(const char *json, const char *key, uint64_t *out)
@@ -468,6 +561,33 @@ static esp_err_t handle_post_brightness(httpd_req_t *req)
     return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t handle_post_mute(httpd_req_t *req)
+{
+    bool muted = !audio_is_muted(); // Toggle by default if body is empty
+    int len = req->content_len;
+    if (len > 0 && len <= 256) {
+        char body[257];
+        int rtot = 0;
+        while (rtot < len) {
+            int r = httpd_req_recv(req, body + rtot, len - rtot);
+            if (r <= 0) return ESP_FAIL;
+            rtot += r;
+        }
+        body[rtot] = '\0';
+        bool parsed = false;
+        if (json_get_bool(body, "muted", &parsed) || json_get_bool(body, "mute", &parsed)) {
+            muted = parsed;
+        }
+    }
+    audio_set_mute(muted);
+    app_config_set_mute(muted);
+
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"muted\":%s}", audio_is_muted() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t handle_post_stop(httpd_req_t *req)
 {
     alert_server_stop();
@@ -524,6 +644,10 @@ static void console_cmd_task(void *arg)
                     if (pct >= 10) app_config_set_display((uint8_t)pct, cfg.auto_dim_sec);
                     lcd_st7789_set_backlight((uint8_t)pct);
                     ESP_LOGI(TAG, "Backlight set to %d%%", pct);
+                } else if (strncmp(line, "mute", 4) == 0) {
+                    bool m = (line[4] == ' ' && (line[5] == '0' || line[5] == '1')) ? (line[5] == '1') : !audio_is_muted();
+                    audio_set_mute(m);
+                    app_config_set_mute(m);
                 }
                 pos = 0;
             }
@@ -570,6 +694,7 @@ esp_err_t alert_server_start(void)
         { .uri = "/api/deepseek/usage",  .method = HTTP_POST, .handler = handle_post_deepseek_usage },
         { .uri = "/api/deepseek/add",    .method = HTTP_POST, .handler = handle_post_deepseek_add },
         { .uri = "/api/brightness",      .method = HTTP_POST, .handler = handle_post_brightness },
+        { .uri = "/api/mute",            .method = HTTP_POST, .handler = handle_post_mute },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(s_server, &uris[i]);

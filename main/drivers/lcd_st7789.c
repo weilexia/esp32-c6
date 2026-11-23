@@ -14,6 +14,8 @@ static const char *TAG = "lcd_st7789";
 static esp_lcd_panel_handle_t s_panel = NULL;
 static SemaphoreHandle_t s_trans_done_sem = NULL;
 static uint8_t s_backlight_pct = 85;
+static void (*s_flush_done_cb)(void *) = NULL;
+static void *s_flush_done_ctx = NULL;
 
 static bool IRAM_ATTR on_lcd_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
                                               esp_lcd_panel_io_event_data_t *edata,
@@ -23,13 +25,16 @@ static bool IRAM_ATTR on_lcd_color_trans_done(esp_lcd_panel_io_handle_t panel_io
     (void)edata;
     (void)user_ctx;
     BaseType_t hp_woken = pdFALSE;
+    if (s_flush_done_cb) {
+        s_flush_done_cb(s_flush_done_ctx);
+    }
     if (s_trans_done_sem) {
         xSemaphoreGiveFromISR(s_trans_done_sem, &hp_woken);
     }
     return hp_woken == pdTRUE;
 }
 
-#define LCD_SPI_CLK_HZ        (40 * 1000 * 1000)
+#define LCD_SPI_CLK_HZ        (60 * 1000 * 1000)
 #define LCD_BL_LEDC_TIMER     LEDC_TIMER_0
 #define LCD_BL_LEDC_MODE      LEDC_LOW_SPEED_MODE
 #define LCD_BL_LEDC_CHANNEL   LEDC_CHANNEL_0
@@ -181,4 +186,18 @@ esp_err_t lcd_st7789_draw_bitmap(int x_start, int y_start, int x_end, int y_end,
         xSemaphoreTake(s_trans_done_sem, pdMS_TO_TICKS(100));
     }
     return err;
+}
+
+void lcd_st7789_set_flush_done_cb(void (*cb)(void *), void *user_ctx)
+{
+    s_flush_done_cb = cb;
+    s_flush_done_ctx = user_ctx;
+}
+
+esp_err_t lcd_st7789_draw_bitmap_async(int x_start, int y_start, int x_end, int y_end, const void *color_data)
+{
+    if (!s_panel) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return esp_lcd_panel_draw_bitmap(s_panel, x_start, y_start, x_end, y_end, color_data);
 }

@@ -17,6 +17,7 @@ static i2c_master_dev_handle_t s_es7210 = NULL;
 static i2s_chan_handle_t s_tx_chan = NULL;
 static i2s_chan_handle_t s_rx_chan = NULL;
 static bool s_ready = false;
+static volatile bool s_muted = false;
 
 static void es8311_init_regs(void)
 {
@@ -109,7 +110,24 @@ static void es7210_init_regs(void)
 
 void audio_pa_enable(bool enable)
 {
+    if (s_muted) {
+        enable = false;
+    }
     gpio_set_level(BOARD_PA_CTRL_GPIO, enable ? 1 : 0);
+}
+
+void audio_set_mute(bool muted)
+{
+    s_muted = muted;
+    if (muted) {
+        gpio_set_level(BOARD_PA_CTRL_GPIO, 0);
+    }
+    ESP_LOGI(TAG, "Audio mute %s", muted ? "ENABLED" : "DISABLED");
+}
+
+bool audio_is_muted(void)
+{
+    return s_muted;
 }
 
 esp_err_t audio_codec_init(void)
@@ -175,6 +193,9 @@ esp_err_t audio_play_tone(uint32_t freq_hz, uint32_t duration_ms, uint8_t volume
 {
     if (!s_ready || !s_tx_chan || duration_ms == 0) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (s_muted) {
+        return ESP_OK;
     }
     if (volume_pct > 100) {
         volume_pct = 100;
@@ -249,6 +270,9 @@ esp_err_t audio_play_wav(const uint8_t *wav_data, size_t wav_len, bool (*should_
     if (!s_ready || !s_tx_chan || !wav_data || wav_len <= 44) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (s_muted) {
+        return ESP_OK;
+    }
 
     // Parse RIFF/WAVE header to locate 'fmt ' sample rate and 'data' chunk
     uint32_t sample_rate = AUDIO_SAMPLE_RATE_HZ;
@@ -309,6 +333,43 @@ esp_err_t audio_play_wav(const uint8_t *wav_data, size_t wav_len, bool (*should_
     i2s_channel_write(s_tx_chan, stereo_chunk, 64 * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(50));
     audio_pa_enable(false);
     return ESP_OK;
+}
+
+void audio_stream_begin(void)
+{
+    if (!s_ready || !s_tx_chan || s_muted) return;
+    audio_pa_enable(true);
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
+
+void audio_stream_write_mono16(const int16_t *samples, size_t sample_count, uint32_t sample_rate)
+{
+    if (!s_ready || !s_tx_chan || s_muted || !samples || sample_count == 0) return;
+    int repeat_factor = (sample_rate > 0 && sample_rate <= 9000) ? 2 : 1;
+    int16_t stereo_chunk[256 * 2];
+    size_t idx = 0;
+    while (idx < sample_count) {
+        size_t out_frames = 0;
+        while (out_frames + (size_t)repeat_factor <= 256 && idx < sample_count) {
+            int16_t s = samples[idx++];
+            for (int r = 0; r < repeat_factor; r++) {
+                stereo_chunk[out_frames * 2] = s;
+                stereo_chunk[out_frames * 2 + 1] = s;
+                out_frames++;
+            }
+        }
+        size_t written = 0;
+        i2s_channel_write(s_tx_chan, stereo_chunk, out_frames * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(100));
+    }
+}
+
+void audio_stream_end(void)
+{
+    if (!s_ready || !s_tx_chan) return;
+    int16_t silence[64 * 2] = {0};
+    size_t written = 0;
+    i2s_channel_write(s_tx_chan, silence, sizeof(silence), &written, pdMS_TO_TICKS(50));
+    audio_pa_enable(false);
 }
 
 static void write_wav_header(uint8_t *hdr, uint32_t pcm_bytes)
